@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "连接 konx-gw 网关（在网关 Web 页创建 read+talk scope 的 API token）",
+        "data": {
+          "host": "主机",
+          "port": "端口",
+          "rtsp_port": "RTSP 端口",
+          "rtsp_user": "RTSP 用户名",
+          "rtsp_password": "RTSP 密码",
+          "token": "API Token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "无法连接网关：{detail}",
+      "invalid_auth": "Token 无效"
+    },
+    "abort": {
+      "already_configured": "该网关已配置"
+    }
+  }
+}

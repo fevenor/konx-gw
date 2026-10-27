@@ -1,0 +1,23 @@
+announce:
+  name: 播放到门口（对讲）
+  description: 经网关向门铃播放语音（需要 M5 设备会话模块）。
+  fields:
+    device_id:
+      name: 设备
+      description: 网关设备 ID
+      required: true
+      example: "<设备ID>"
+      selector:
+        text:
+    text:
+      name: 文本
+      description: 将由 HA TTS 转语音后发送（须自行先转 PCM16 8k 时可用 url）
+      required: false
+      selector:
+        text:
+    url:
+      name: 音频 URL
+      description: WAV/PCM16 8kHz 单声道音频 URL
+      required: false
+      selector:
+        text:

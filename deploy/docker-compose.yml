@@ -1,0 +1,26 @@
+services:
+  konx-gw:
+    image: konx-gw:full
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: konx-gw
+    restart: unless-stopped
+    ports:                           # 桥接 + 端口映射（最终部署形态，无组播需求）
+      - "8080:8080"                  # Web / REST / WS
+      - "8554:8554"                  # RTSP（下游客户端拉流）
+      - "8000:8000"                  # ONVIF
+    environment:
+      - KONX_CLOUD_USER=${KONX_CLOUD_USER}
+      - KONX_CLOUD_PASS_MD5=${KONX_CLOUD_PASS_MD5}
+      - TZ=Asia/Shanghai
+      - KONX_LOG_LEVEL=info
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/etc/konx-gw/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/konx-gw", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Connect to a konx-gw gateway (create an API token with read+talk scope on the gateway web UI first)",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "rtsp_port": "RTSP port",
+          "rtsp_user": "RTSP username",
+          "rtsp_password": "RTSP password",
+          "token": "API token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the gateway: {detail}",
+      "invalid_auth": "Invalid token"
+    },
+    "abort": {
+      "already_configured": "This gateway is already configured"
+    }
+  }
+}

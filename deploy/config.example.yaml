@@ -1,0 +1,63 @@
+# konx-gw 配置示例（完整字段见 docs/DESIGN.md §13）
+gw_id: front-gate
+# 凭据建议经 KONX_CLOUD_USER / KONX_CLOUD_PASS_MD5 环境变量注入
+cloud:
+  user: ""                # 或 env
+  pass_md5: ""            # 或 env（明文密码可用 KONX_CLOUD_PASS，自动转 MD5 不落盘）
+  device_list: auto       # 设备列表端点：auto=LoadDeviceInfo 失败/空时降级 SearchBindDev
+                          # （旧端点在官方云已 404）| loaddeviceinfo | searchbinddev
+  # 应用身份可选覆盖（缺省内置 GwellDemo 身份，向后兼容）：
+  # 云端对 demo 身份有严格呼叫频率门控（15-30 分钟惩罚窗），生产 App
+  # 身份不受限（真机实测）。也可经 KONX_CLOUD_APP_ID /
+  # KONX_CLOUD_APP_TOKEN / KONX_CLOUD_APP_VERSION / KONX_CLOUD_APP_PACKAGE
+  # 环境变量注入。生产组合示例（身份参数由部署方自备，官方客户端资料）：
+  #   app_id: <32位hex>
+  #   app_token: <64位hex>
+  #   app_version: "<位压缩版本号>"
+  #   app_package: <生产包名>
+  app_id: ""              # 32 位小写 hex，留空 = demo 身份
+  app_token: ""           # 64 位小写 hex，留空 = demo 身份
+  app_version: ""         # 纯数字，留空 = "1"
+  app_package: ""         # Android 包名，留空 = com.gwelldemo
+p2p:
+  trace: false            # 协议调试：全帧落盘 /data/trace/
+devices:
+  - id: "<设备ID>"
+    name: 前门门铃
+    ip: 192.168.1.100
+media:
+  source: external-rtsp       # 显式单选: p2p-av(M5 后推荐) | external-rtsp | device-rtsp | off
+  external_url: "rtsp://<NVR用户>:<NVR密码>@<NVR-IP>:554/<转发路径>"   # {profile}/{device} 可作占位符
+  device_rtsp_exclusive_ack: false
+  event_stream_hold: 15s
+  idle_stop: 60s
+  ffmpeg_path: /usr/bin/ffmpeg
+  p2p:                        # source=p2p-av 时的设备会话取流（真机实测验证）
+    treated_password: 0       # 直配 treated 密码；0=启动取流时经 cloud 密码链自动解析
+    hard_idle: 15m            # 空闲硬挂断（P2P 呼叫重建成本高，勿设短）
+rtsp:
+  listen: ":8554"
+  describe_wait: 10s       # DESCRIBE 早到等待（源已发起未就绪时，p2p-av 呼叫建立 ~5-8s；无源槽位立即 404）
+onvif:
+  enable: true
+  listen: ":8000"
+  allow_anonymous: true
+  topics: ["tns1:Doorbell/Stimulus"]
+advertise:                  # 桥接端口映射：对外公告地址（端口一一映射时只填 host）
+  host: ""                  # 宿主机 IP，如 192.168.1.10
+  rtsp_port: 8554
+  http_port: 8080
+mqtt:
+  enable: false
+  broker: ""                # tcp://host:1883
+  user: ""
+  pass: ""
+  discovery: true
+web:
+  listen: ":8080"
+  data_dir: /data
+events:
+  retention_days: 90
+  max_rows: 100000
+  keep_raw: true            # U1 门铃载荷验证完成前保持 true
+log: { level: info, format: json }

@@ -1,0 +1,78 @@
+{
+ "rc532_enc": [
+  {
+   "in": "0001020304050607",
+   "out": "fadc059a7f5cac41"
+  },
+  {
+   "in": "0000000000000000",
+   "out": "6a4e8ef8f7a22ae3"
+  },
+  {
+   "in": "ffffffffffffffff",
+   "out": "233cbbd52453d3a3"
+  },
+  {
+   "in": "20676283becba53a",
+   "out": "ecf0ed677ca5fe79"
+  }
+ ],
+ "rc532_roundtrip": true,
+ "rc516": [
+  {
+   "code1": 497459251,
+   "code2": 2395831484,
+   "derived": 372206472
+  },
+  {
+   "code1": 497459251,
+   "code2": 0,
+   "derived": 1275917554
+  },
+  {
+   "code1": 497459251,
+   "code2": 4294967295,
+   "derived": 4285709510
+  }
+ ],
+ "list_request": {
+  "term": 2204264224,
+  "hex": "7f2b2400dd05a9a4dfd11c8f6e0f0be11331039001000000b1bba3ee14dc933000000000"
+ },
+ "list_decrypted_head": "7f2b2400206762830000000000000000a092868301000000",
+ "fb": {
+  "params": {
+   "uid": 2204264224,
+   "c1": 983944126,
+   "c2": 2127405622,
+   "s1": 497459251,
+   "s2": 2395831484,
+   "s2d": 372206472
+  },
+  "detect_tick_fixed": "7f012800dd05a9a4dfd11c8f2e134ebd72a9ca3a01000000db3918c0572dc72ba703bff084b2fa18",
+  "certify": "7f032c00dd05a9a4dfd11c8f5f1e616daf81324101000100d2f787aaf8327e3792708880b8f991a61a9cd7d4",
+  "init_info": "7f815000dd05a9a4dfd11c8f733363bf3360163a01000000149603f76674142393b22529e0969dfd93b22529e0969dfd93b22529e0969dfd93b22529e0969dfd93b22529e0969dfd93b22529e0969dfd",
+  "heart": "7f213400dd05a9a4dfd11c8f253478a9620d2b8201000000c7e74bdd1343ca1277415dca230a4c40e8b2ff6f3f49926136a2cd7e",
+  "ack04": "7f041800dd05a9a4dfd11c8fc255e6bbb55a8f0a01000000",
+  "ack35": "7f351800dd05a9a4dfd11c8ffc0a4265a17cd1fb01000000"
+ },
+ "alarm_payload": {
+  "dev_id": 10000001,
+  "alarm_type": 2,
+  "data": "616263"
+ },
+ "gw_chksum_range64": 0,
+ "ping_fixed": {
+  "hex": "70011800546bcd7a3412341234123412341234123412fd7b",
+  "parsed": {
+   "type": 1,
+   "key": 4660,
+   "tag": 31741,
+   "payload": "6079f968000000000000000000000000"
+  }
+ },
+ "hash_key": {
+  "empty128": 3570899994,
+  "hello": 1729687499
+ }
+}

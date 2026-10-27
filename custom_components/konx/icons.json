@@ -1,0 +1,9 @@
+{
+  "entity": {
+    "event": {
+      "doorbell": {
+        "default": "mdi:doorbell"
+      }
+    }
+  }
+}

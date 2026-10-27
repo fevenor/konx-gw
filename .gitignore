@@ -1,0 +1,9 @@
+# 运行数据与本地产物
+data/
+*.db
+trace/
+
+# 构建产物与日志
+konx-gw
+*.log
+*.out

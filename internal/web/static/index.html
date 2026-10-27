@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>konx-gw</title>
+<style>
+:root{--bg:#0f1420;--card:#171e2e;--line:#253048;--tx:#e8edf7;--mut:#8b98b4;--ok:#34d399;--warn:#fbbf24;--err:#f87171;--acc:#60a5fa}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:12px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+header h1{font-size:16px;font-weight:600}
+header .pill{font-size:12px;padding:2px 10px;border-radius:99px;border:1px solid var(--line)}
+.pill.ok{color:var(--ok);border-color:var(--ok)} .pill.down{color:var(--err);border-color:var(--err)}
+.pill.mid{color:var(--warn);border-color:var(--warn)}
+nav{display:flex;gap:4px;margin-left:auto}
+nav button{background:none;border:1px solid transparent;color:var(--mut);padding:6px 12px;border-radius:8px;cursor:pointer;font-size:13px}
+nav button.on{color:var(--tx);border-color:var(--line);background:var(--card)}
+main{max-width:1100px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h2{font-size:13px;color:var(--mut);font-weight:600;margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--mut);text-align:left;font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid rgba(37,48,72,.5)}
+.badge{font-size:11px;padding:1px 8px;border-radius:99px;background:rgba(96,165,250,.15);color:var(--acc)}
+.badge.doorbell{background:rgba(52,211,153,.15);color:var(--ok)}
+.badge.unknown{background:rgba(251,191,36,.15);color:var(--warn)}
+.badge.err{background:rgba(248,113,113,.15);color:var(--err)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
+.kv{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(37,48,72,.5)}
+.kv b{font-weight:500;color:var(--mut)}
+button.act{background:var(--acc);color:#08111f;border:none;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer}
+button.act.sec{background:var(--card);color:var(--tx);border:1px solid var(--line)}
+button.act:disabled{opacity:.45;cursor:not-allowed}
+#live{width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;object-fit:contain}
+.talkbar{display:flex;gap:10px;margin-top:10px;align-items:center}
+.muted{color:var(--mut);font-size:12px}
+pre.raw{background:#0b0f18;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11px;overflow:auto;max-height:200px}
+#loginbox{max-width:360px;margin:80px auto}
+input[type=password]{width:100%;background:#0b0f18;border:1px solid var(--line);border-radius:8px;color:var(--tx);padding:10px;font-size:14px}
+.row{display:flex;gap:10px;align-items:center}
+select{background:#0b0f18;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:8px}
+</style>
+</head>
+<body>
+<div id="loginbox" class="card" hidden>
+  <h2>konx-gw 登录</h2>
+  <div class="row"><input type="password" id="pw" placeholder="管理密码（见容器首次启动日志）"><button class="act" onclick="doLogin()">登录</button></div>
+  <p class="muted" id="loginerr" style="margin-top:8px"></p>
+</div>
+<div id="app" hidden>
+<header>
+  <h1>Konx 网关</h1>
+  <span class="pill" id="cloudPill">cloud</span>
+  <span class="pill" id="p2pPill">p2p</span>
+  <nav>
+    <button data-v="status" class="on">状态</button>
+    <button data-v="events">事件</button>
+    <button data-v="live">实时</button>
+    <button data-v="clients">客户端</button>
+  </nav>
+</header>
+<main>
+<section id="v-status">
+  <div class="card"><h2>会话</h2><div class="grid" id="sesGrid"></div></div>
+  <div class="card"><h2>设备</h2><div id="devBox"></div></div>
+</section>
+<section id="v-events" hidden>
+  <div class="card">
+    <h2>门铃 / 事件记录</h2>
+    <div class="row" style="margin-bottom:10px">
+      <select id="fScope" onchange="loadEvents()">
+        <option value="">全部范围</option>
+        <option value="device">设备事件</option>
+        <option value="cloud">账号/云端</option>
+        <option value="gw">网关</option>
+      </select>
+      <select id="fType"><option value="">全部类型</option></select>
+      <button class="act sec" onclick="loadEvents()">刷新</button>
+      <span class="muted" id="evCount"></span>
+    </div>
+    <table><thead><tr><th>时间</th><th>范围</th><th>来源</th><th>类型</th><th>MsgID</th><th>详情</th></tr></thead><tbody id="evBody"></tbody></table>
+  </div>
+</section>
+<section id="v-live" hidden>
+  <div class="card">
+    <h2>实时画面</h2>
+    <div class="row" style="margin-bottom:10px">
+      <select id="devSel"></select>
+      <select id="profSel"><option value="main">主码流</option><option value="sub">子码流</option></select>
+      <button class="act" onclick="startLive()">开始</button>
+      <button class="act sec" onclick="stopLive()">停止</button>
+      <span id="srcTag" class="pill mid">来源: …</span>
+    </div>
+    <img id="live" hidden>
+    <p class="muted" id="liveHint">HLS 播放需要转码管道运行中；停止后源将在空闲超时后自动关闭以保护设备。</p>
+    <div class="talkbar">
+      <button class="act" id="talkBtn" onclick="toggleTalk()" disabled>按住说话（等待 M5 设备会话模块）</button>
+      <span class="muted" id="talkState"></span>
+    </div>
+  </div>
+</section>
+<section id="v-clients" hidden>
+  <div class="card"><h2>已连接客户端</h2><table><thead><tr><th>类型</th><th>端点</th><th>用户</th><th>连接时间</th><th>最近活动</th></tr></thead><tbody id="clBody"></tbody></table></div>
+</section>
+</main>
+</div>
+<script>
+let TOK = localStorage.getItem('konx_token') || '';
+let ws = null, wsTimer = null, curView = 'status';
+
+async function api(path, opts={}) {
+  const r = await fetch(path, {...opts, headers: {...(opts.headers||{}), Authorization: 'Bearer '+TOK}});
+  if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+  return r;
+}
+function showLogin(){ document.getElementById('app').hidden = true; document.getElementById('loginbox').hidden = false; }
+async function doLogin(){
+  const pw = document.getElementById('pw').value;
+  const r = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password:pw})});
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) { document.getElementById('loginerr').textContent = j.error?.message || '登录失败'; return; }
+  TOK = j.token; localStorage.setItem('konx_token', TOK);
+  location.reload();
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  curView = b.dataset.v;
+  document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('on', x===b));
+  ['status','events','live','clients'].forEach(v => document.getElementById('v-'+v).hidden = v !== curView);
+  if (curView==='events') loadEvents();
+  if (curView==='clients') loadClients();
+});
+function pill(el, txt, cls){ el.textContent = txt; el.className = 'pill '+cls; }
+function fmtTs(ts){ return new Date(ts*1000).toLocaleString(); }
+function srcShort(kind){
+  switch(kind){
+    case 'p2p-av': return 'P2P（设备会话 p2pv3）';
+    case 'external-rtsp': return 'RTSP（NVR/外部转发）';
+    case 'device-rtsp': return 'RTSP（设备直连·独占）';
+    case 'off': return '未启用（纯事件网关）';
+    default: return kind;
+  }
+}
+
+let lastSnap = null;
+async function refresh(){
+  try {
+    const r = await api('/api/state'); if(!r.ok) return;
+    const s = await r.json(); lastSnap = s;
+    pill(document.getElementById('cloudPill'), 'cloud '+(s.cloud||'?'), s.cloud==='up'?'ok':'down');
+    const ready = s.p2p === 'ready';
+    pill(document.getElementById('p2pPill'), 'p2p '+s.p2p+(s.p2p_server?' · '+s.p2p_server:''), ready?'ok':(s.p2p==='disabled'?'mid':'down'));
+    const g = document.getElementById('sesGrid');
+    g.innerHTML = `<div class="kv"><b>云登录</b><span>${s.cloud}</span></div>
+      <div class="kv"><b>推送会话</b><span>${s.p2p}</span></div>
+      <div class="kv"><b>P2P 服务器</b><span>${s.p2p_server||'-'}</span></div>
+      <div class="kv"><b>RTT</b><span>${s.p2p_rtt_ms||'-'} ms</span></div>
+      <div class="kv"><b>取流协议</b><span>${srcShort(s.source)}</span></div>
+      <div class="kv"><b>运行时长</b><span>${Math.floor(s.uptime/60)} min</span></div>
+      <div class="kv"><b>客户端</b><span>${Object.entries(s.clients||{}).map(([k,v])=>k+':'+v).join(' ')||'-'}</span></div>
+      <div class="kv"><b>版本</b><span>${s.version}</span></div>`;
+    const dev = s.devices?.[0];
+    document.getElementById('devBox').innerHTML = (s.devices||[]).map(d=>`
+      <table><tr><td><b>${d.name}</b> <span class="badge">${d.id}</span></td>
+      <td>主源 ${d.source?.main||'-'} / 子源 ${d.source?.sub||'-'}</td></tr></table>`).join('') || '<p class="muted">未配置设备</p>';
+    if (dev) {
+      const sel = document.getElementById('devSel');
+      if (!sel.options.length) { (s.devices||[]).forEach(d => sel.add(new Option(d.name, d.id))); }
+    }
+  } catch(e) {}
+}
+const SCOPE_LABEL = {device:'设备', cloud:'账号/云端', gw:'网关'};
+const SCOPE_CLS = {device:'doorbell', cloud:'', gw:'err'};
+function scopeBadge(e){
+  const sc = e.scope || (e.device_id==='cloud'?'cloud':(e.device_id==='gw'?'gw':'device'));
+  return `<span class="badge ${SCOPE_CLS[sc]||''}">${SCOPE_LABEL[sc]||sc}</span>`;
+}
+function srcLabel(e){
+  if ((e.scope||'')==='device' || ['doorbell.press','device.alarm','device.calling','device.online','device.offline'].includes(e.type))
+    return e.device_name ? `${e.device_name} <span class="muted">(${e.device_id})</span>` : e.device_id;
+  if (e.device_id==='cloud') return '云平台会话';
+  return '网关自身';
+}
+async function loadEvents(){
+  const t = document.getElementById('fType').value;
+  const sc = document.getElementById('fScope').value;
+  const r = await api('/api/events?limit=100'+(t?'&type='+t:'')+(sc?'&scope='+sc:'')); if(!r.ok) return;
+  const j = await r.json();
+  const rows = (j.events||[]).map(e => `<tr>
+    <td>${fmtTs(e.ts_recv)}</td>
+    <td>${scopeBadge(e)}</td>
+    <td>${srcLabel(e)}</td>
+    <td><span class="badge ${e.type==='doorbell.press'?'doorbell':(e.type==='unknown'?'unknown':'')}">${e.type}</span></td>
+    <td>${e.msg_id||'-'}</td>
+    <td class="muted">${e.type==='unknown' ? `<a href="#" onclick="showRaw(${e.id});return false">查看原始载荷</a>` : (e.payload||'').slice(0,60)}</td></tr>`).join('');
+  document.getElementById('evBody').innerHTML = rows || '<tr><td colspan="6" class="muted">暂无事件</td></tr>';
+  document.getElementById('evCount').textContent = (j.events||[]).length + ' 条';
+}
+async function showRaw(id){
+  const r = await api('/api/events/raw?id='+id); const j = await r.json();
+  alert('原始载荷 (hex):\n'+(j.raw_hex||'').replace(/(.{64})/g,'$1\n'));
+}
+async function loadClients(){
+  const r = await api('/api/clients'); if(!r.ok) return;
+  const j = await r.json();
+  document.getElementById('clBody').innerHTML = (j.clients||[]).map(c=>`<tr>
+    <td><span class="badge">${c.kind}</span></td><td>${c.peer||c.id}</td><td>${c.user||''}</td>
+    <td>${fmtTs(c.connected_at)}</td><td>${fmtTs(c.last_active)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无客户端</td></tr>';
+}
+// 取流来源标签：协议优先，任何状态下都直接回答"这是 P2P 还是 RTSP"
+const SRC_LABEL = {
+  'p2p-av':        {t:'P2P',  d:'经设备会话(p2pv3)取流，不占设备 RTSP 名额', cls:'ok'},
+  'external-rtsp': {t:'RTSP', d:'从 NVR/外部转发拉流',   cls:'ok'},
+  'device-rtsp':   {t:'RTSP', d:'直连设备554端口(独占,NVR须让位)', cls:'mid'},
+  'off':           {t:'未启用', d:'非P2P亦非RTSP·纯事件网关模式', cls:'down'},
+};
+function refreshSrcTag(){
+  const el = document.getElementById('srcTag');
+  const hint = document.getElementById('liveHint');
+  if (!el || !lastSnap) return;
+  const kind = lastSnap.source || 'off';
+  const L = SRC_LABEL[kind] || {t:kind, d:'未知来源类型', cls:'mid'};
+  let profState = '';
+  if (kind !== 'off') {
+    const dev = (lastSnap.devices||[])[0];
+    profState = dev && dev.source ? ` · 主源:${dev.source.main||'-'} / 子源:${dev.source.sub||'-'}` : '';
+  }
+  el.className = 'pill ' + L.cls;
+  el.textContent = `取流协议: ${L.t} · ${L.d}${profState}`;
+  if (hint) {
+    hint.textContent = kind === 'off'
+      ? '当前为纯事件网关：门铃事件推送正常，但音视频未接入。要观看画面，在 config.yaml 将 media.source 设为 external-rtsp(填NVR转发地址) / device-rtsp(需独占确认) / p2p-av(P2P 直连取流) 后重启。'
+      : (kind === 'device-rtsp'
+          ? '注意：设备 RTSP 并发能力=1，此模式独占设备554端口，NVR 需让位或分时。'
+          : 'MJPEG 子码流预览中；停止后源将在空闲超时后自动关闭以保护设备。');
+  }
+}
+
+// live view: MJPEG 低延迟简览（子码流）
+let liveTimer = null;
+async function startLive(){
+  const dev = document.getElementById('devSel').value;
+  const prof = document.getElementById('profSel').value;
+  const img = document.getElementById('live');
+  img.hidden = false;
+  img.src = `/api/devices/${dev}/stream.mjpeg?tok=${encodeURIComponent(TOK)}&_=${Date.now()}`;
+  document.getElementById('liveHint').textContent = 'MJPEG 子码流预览中…';
+}
+function stopLive(){ document.getElementById('live').hidden = true; document.getElementById('live').src=''; }
+// talk (unavailable until M5)
+let talkOn = false;
+async function toggleTalk(){
+  const dev = document.getElementById('devSel').value;
+  if (!talkOn) {
+    const r = await api(`/api/devices/${dev}/talk/start`, {method:'POST'});
+    const j = await r.json().catch(()=>({}));
+    document.getElementById('talkState').textContent = j.error?.message || '对讲中';
+    talkOn = r.ok;
+  } else {
+    await api(`/api/devices/${dev}/talk/stop`, {method:'POST'});
+    talkOn = false; document.getElementById('talkState').textContent = '';
+  }
+}
+function connectWS(){
+  const proto = location.protocol==='https:'?'wss':'ws';
+  ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${encodeURIComponent(TOK)}`);
+  ws.onmessage = (m) => {
+    const msg = JSON.parse(m.data);
+    if (msg.type === 'state.changed' || msg.type === 'client.changed') { refresh(); refreshSrcTag(); }
+    if (msg.type === 'event.new') {
+      const e = msg.data;
+      if (curView==='events') loadEvents();
+      if (e.type==='doorbell.press') {
+        const d = document.getElementById('devSel'); // subtle cue
+        document.title = '\u{1F514} konx-gw';
+        setTimeout(()=>document.title='konx-gw', 4000);
+      }
+    }
+  };
+  ws.onclose = () => { clearTimeout(wsTimer); wsTimer = setTimeout(connectWS, 3000); };
+}
+(async function init(){
+  if (!TOK) return showLogin();
+  const r = await fetch('/api/state', {headers:{Authorization:'Bearer '+TOK}});
+  if (r.status===401) return showLogin();
+  document.getElementById('app').hidden = false;
+  document.getElementById('loginbox').hidden = true;
+  await refresh(); refreshSrcTag(); connectWS(); setInterval(()=>{refresh();refreshSrcTag();}, 10000);
+})();
+</script>
+</body>
+</html>

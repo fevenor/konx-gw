@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "連接 konx-gw 閘道（在閘道 Web 頁建立 read+talk scope 的 API token）",
+        "data": {
+          "host": "主機",
+          "port": "連接埠",
+          "rtsp_port": "RTSP 連接埠",
+          "rtsp_user": "RTSP 使用者名稱",
+          "rtsp_password": "RTSP 密碼",
+          "token": "API Token"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "無法連接閘道：{detail}",
+      "invalid_auth": "Token 無效"
+    },
+    "abort": {
+      "already_configured": "該閘道已設定"
+    }
+  }
+}
