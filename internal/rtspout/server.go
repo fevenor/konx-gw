@@ -6,6 +6,7 @@
 package rtspout
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -21,6 +22,8 @@ import (
 	"github.com/fevenor/konx-gw/internal/media"
 )
 
+var _ sourceManager = (*media.Manager)(nil)
+
 // Authorizer checks RTSP Basic credentials.
 type Authorizer interface {
 	CheckRTSP(user, pass string) bool
@@ -29,13 +32,43 @@ type Authorizer interface {
 // ClientHook is called on session open/close for the client registry.
 type ClientHook func(kind string, up bool)
 
+// sourceManager 是出口层对媒体源管理器的依赖缝（生产 *media.Manager，
+// 测试注入计数 fake）。出口层所有路径统一传「归一化 profile」，键格式
+// device|profile。
+type sourceManager interface {
+	Acquire(deviceID string, p media.Profile) (func(), error)
+	Release(deviceID string, p media.Profile)
+	Desc(deviceID string, p media.Profile) *description.Session
+	HasSlot(deviceID string, p media.Profile) bool
+	Prewarm(deviceID string)
+	NormProfile(p media.Profile) media.Profile
+	RegisterWriter(deviceID string, p media.Profile, fn func(*description.Media, *rtp.Packet))
+	UnregisterWriter(deviceID string, p media.Profile)
+}
+
+// streamEntry 是一个 (device, 归一化 profile) 的共享出口流：多个观众
+// 会话复用同一 ServerStream；viewers 为持有该键的会话数（INV1：
+// viewers==持有该键的会话数；INV2：viewers>0 ⟹ 源槽存活——每个
+// 记账会话在 SETUP 时恰 Acquire 一次源引用）。
+type streamEntry struct {
+	ss      *gortsplib.ServerStream
+	viewers int
+}
+
+// sessionRec 是一个观众会话的出口记账：keys 为该会话 SETUP 成功记过
+// 账的出口键集合（同会话多 track 去重，每键恰一次 Acquire/Release）；
+// played 标记是否进入过 PLAY（hook 下行计数以 played 为准）。
+type sessionRec struct {
+	keys   map[string]bool
+	played bool
+}
+
 type Server struct {
-	srv     *gortsplib.Server
-	mgr     *media.Manager
-	auth    Authorizer
-	hook    ClientHook
-	log     *slog.Logger
-	advPort int
+	srv  *gortsplib.Server
+	mgr  sourceManager
+	auth Authorizer
+	hook ClientHook
+	log  *slog.Logger
 
 	// DescribeWait 是 DESCRIBE/SETUP 在“源已发起但描述未就绪”（p2p-av
 	// 呼叫建立 ~5-8s）时的最长等待；仅当 Manager 已有该 (device,profile)
@@ -50,16 +83,21 @@ type Server struct {
 
 	prewarmedAt map[string]time.Time
 
+	// 出口 per-session 记账。INV3：条目的建立（Initialize+RegisterWriter）
+	// 与销毁（Close+UnregisterWriter）全部在 mu 临界区内配对完成；
+	// INV4 锁序 mu → Manager.mu(Desc/Acquire/Release) → writer 锁，
+	// Manager 不在持自身锁时回调出口层（ss.Close 仅异步取消 reader，
+	// 持 mu 调用无死锁）。
 	mu       sync.Mutex
-	streams  map[string]*gortsplib.ServerStream // key device|profile
-	sessions map[*gortsplib.ServerSession]string
+	streams  map[string]*streamEntry // key device|profile（归一化）
+	sessions map[*gortsplib.ServerSession]*sessionRec
 }
 
-func New(listen string, mgr *media.Manager, auth Authorizer, hook ClientHook, log *slog.Logger, advertisedPort int) *Server {
+func New(listen string, mgr sourceManager, auth Authorizer, hook ClientHook, log *slog.Logger) *Server {
 	s := &Server{
-		mgr: mgr, auth: auth, hook: hook, log: log, advPort: advertisedPort,
-		streams:     map[string]*gortsplib.ServerStream{},
-		sessions:    map[*gortsplib.ServerSession]string{},
+		mgr: mgr, auth: auth, hook: hook, log: log,
+		streams:     map[string]*streamEntry{},
+		sessions:    map[*gortsplib.ServerSession]*sessionRec{},
 		prewarmedAt: map[string]time.Time{},
 	}
 	s.srv = &gortsplib.Server{
@@ -119,19 +157,22 @@ func (s *Server) challenge(resp *base.Response) *base.Response {
 	return resp
 }
 
-// stream returns (or lazily builds) the ServerStream for a slot.
-func (s *Server) stream(dev string, prof media.Profile) (*gortsplib.ServerStream, error) {
+// errNotReady 表示源描述尚未就绪（槽位在建或呼叫建立中）。
+var errNotReady = errors.New("stream not ready")
+
+// streamFor 查找或建立 (device, 归一化 profile) 的出口流条目。查-建-存
+// 全程持 mu（消灭并发双建窗口）；命中/新建均不改变 viewers、不占源
+// 引用——DESCRIBE 复用保持预热语义，源引用计数只由 SETUP 持有。
+func (s *Server) streamFor(dev string, prof media.Profile) (*streamEntry, error) {
 	key := dev + "|" + string(prof)
 	s.mu.Lock()
-	if ss, ok := s.streams[key]; ok {
-		s.mu.Unlock()
-		return ss, nil
+	defer s.mu.Unlock()
+	if e, ok := s.streams[key]; ok {
+		return e, nil
 	}
-	s.mu.Unlock()
-
 	desc := s.mgr.Desc(dev, prof)
 	if desc == nil {
-		return nil, fmt.Errorf("stream not ready")
+		return nil, errNotReady
 	}
 	ss := &gortsplib.ServerStream{Server: s.srv, Desc: desc}
 	if err := ss.Initialize(); err != nil {
@@ -140,30 +181,42 @@ func (s *Server) stream(dev string, prof media.Profile) (*gortsplib.ServerStream
 	// route upstream packets into the server stream
 	s.mgr.RegisterWriter(dev, prof, func(md *description.Media, pkt *rtp.Packet) {
 		// gortsplib v4 ServerStream 在 Close 后再写会内部 panic（nil
-		// deref）：观众断开→dropStream 与呼叫拆链尾包竞态属正常时序，
+		// deref）：观众断开→拆条目与呼叫拆链尾包竞态属正常时序，
 		// egress 是尽力而为路径——吞掉已关闭流的写入 panic。
 		defer func() { _ = recover() }()
 		if err := ss.WritePacketRTP(md, pkt); err != nil {
 			s.log.Debug("write rtp", "err", err)
 		}
 	})
-	s.mu.Lock()
-	s.streams[key] = ss
-	s.mu.Unlock()
-	return ss, nil
+	e := &streamEntry{ss: ss}
+	s.streams[key] = e
+	return e, nil
 }
 
-func (s *Server) dropStream(dev string, prof media.Profile) {
-	key := dev + "|" + string(prof)
-	s.mu.Lock()
-	ss, ok := s.streams[key]
-	delete(s.streams, key)
-	s.mu.Unlock()
-	if ok {
-		ss.Close()
+// closeEntryLocked 拆除一个出口流条目（调用方须持 mu）。幂等：条目不
+// 存在直接返回。与 streamFor 的建立路径在同一锁内配对（INV3）；
+// ss.Close 仅异步取消 reader 会话（其 OnSessionClose 在本临界区外由
+// 服务循环排队执行），持锁调用无死锁（INV4）。
+func (s *Server) closeEntryLocked(key, dev string, prof media.Profile) {
+	e, ok := s.streams[key]
+	if !ok {
+		return
 	}
-	// 对称注销 egress writer：避免呼叫拆链尾包继续喂已关闭的流
+	delete(s.streams, key)
+	e.ss.Close()
 	s.mgr.UnregisterWriter(dev, prof)
+}
+
+// splitKey 拆解 device|profile 键（出口记账键的逆运算）。
+func splitKey(key string) (dev string, prof media.Profile, ok bool) {
+	d, p, found := strings.Cut(key, "|")
+	if !found || d == "" {
+		return "", "", false
+	}
+	if mp := media.Profile(p); mp == media.ProfileMain || mp == media.ProfileSub {
+		return d, mp, true
+	}
+	return "", "", false
 }
 
 // --- gortsplib handlers ---
@@ -174,22 +227,39 @@ func (s *Server) OnConnClose(*gortsplib.ServerHandlerOnConnCloseCtx) {}
 
 func (s *Server) OnSessionOpen(*gortsplib.ServerHandlerOnSessionOpenCtx) {}
 
+// OnSessionClose 是观众会话的统一收尾（TEARDOWN/断开/超时/被动关闭都
+// 走这里）：删会话记账；对每个持有键做 Release+viewers--，viewers 归
+// 零才拆共享流条目（多观众互不拆台，修「任一观众断开杀死全体流」）。
 func (s *Server) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	s.mu.Lock()
-	id, ok := s.sessions[ctx.Session]
+	rec, ok := s.sessions[ctx.Session]
 	delete(s.sessions, ctx.Session)
+	if ok {
+		for key := range rec.keys {
+			if e, exists := s.streams[key]; exists {
+				if e.viewers > 0 {
+					e.viewers--
+				}
+				if e.viewers == 0 {
+					if dev, prof, parsed := splitKey(key); parsed {
+						s.closeEntryLocked(key, dev, prof)
+					}
+				}
+			}
+		}
+	}
 	s.mu.Unlock()
 	if !ok {
 		return
 	}
-	if s.hook != nil {
+	// hook 下行计数以 played 为准（SETUP 未 PLAY 的会话不计观众）
+	if rec.played && s.hook != nil {
 		s.hook("rtsp", false)
 	}
-	// release the source reference acquired at SETUP
-	if v := strings.TrimPrefix(id, "rtsp:"); v != id {
-		if parts := strings.SplitN(v, "/", 2); len(parts) == 2 {
-			s.mgr.Release(parts[0], media.Profile(parts[1]))
-			s.dropStream(parts[0], media.Profile(parts[1]))
+	// 释放该会话在 SETUP 时取得的源引用（每键恰一次，锁外调 Manager）
+	for key := range rec.keys {
+		if dev, prof, parsed := splitKey(key); parsed {
+			s.mgr.Release(dev, prof)
 		}
 	}
 }
@@ -248,7 +318,9 @@ func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Re
 	if !s.authorize(ctx.Request) {
 		return s.challenge(&base.Response{}), nil, nil
 	}
-	ss, err := s.stream(dev, prof)
+	// 键统一归一后再查/建流（与 SETUP/记账/writer 注册同键）
+	prof = s.mgr.NormProfile(prof)
+	e, err := s.streamFor(dev, prof)
 	if err != nil {
 		// lazy source: 认证 DESCRIBE = 观看意图，冷却窗内触发预热呼叫；
 		// NVR-style clients 重试 DESCRIBE/SETUP。无凭据请求已在 authorize
@@ -257,13 +329,13 @@ func (s *Server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Re
 		// 早到竞态：源已发起但描述未就绪（p2p 呼叫建立 ~5-8s）——有槽位
 		// 则最多 DescribeWait 内等描述合成，超时仍 404。
 		if s.waitStreamReady(dev, prof) {
-			ss, err = s.stream(dev, prof)
+			e, err = s.streamFor(dev, prof)
 		}
 	}
 	if err != nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
-	return &base.Response{StatusCode: base.StatusOK}, ss, nil
+	return &base.Response{StatusCode: base.StatusOK}, e.ss, nil
 }
 
 func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
@@ -274,40 +346,97 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 	if !s.authorize(ctx.Request) {
 		return s.challenge(&base.Response{}), nil, nil
 	}
+	// 键统一归一（修 writer 覆盖互踩）：streams/sessions 记账与
+	// RegisterWriter/UnregisterWriter 全部使用归一化 profile。
+	prof = s.mgr.NormProfile(prof)
+	key := dev + "|" + string(prof)
+
+	// ① 同会话多 track 去重：该键已记账 → 直接复用既有流（不重复
+	// Acquire，修「每 track 一次 Acquire 只配一次 Release」的引用泄漏）
+	s.mu.Lock()
+	if rec, held := s.sessions[ctx.Session]; held && rec.keys[key] {
+		e, exists := s.streams[key]
+		s.mu.Unlock()
+		if exists {
+			return &base.Response{StatusCode: base.StatusOK}, e.ss, nil
+		}
+		// 已记账但条目已被源停拆（防御路径）：源引用仍由会话记账持
+		// 有，这里不重建条目——让客户端按 NVR 语义重试。
+		return &base.Response{StatusCode: base.StatusServiceUnavailable}, nil, nil
+	}
+	s.mu.Unlock()
+
+	// ② 取源引用（SETUP 即记账；设备未知 → 404）
 	if _, err := s.mgr.Acquire(dev, prof); err != nil {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil, nil
 	}
-	ss, err := s.stream(dev, prof)
+	// ③ 建流（查-建同临界区）；早到竞态：Acquire 已建槽位，等待描述
+	// 就绪后重试（同 DESCRIBE 语义）
+	e, err := s.streamFor(dev, prof)
 	if err != nil {
-		// source still starting; NVR-style clients retry DESCRIBE/SETUP
-		// 早到竞态：Acquire 已建槽位，等待描述就绪（同 DESCRIBE 语义）
 		if s.waitStreamReady(dev, prof) {
-			ss, err = s.stream(dev, prof)
+			e, err = s.streamFor(dev, prof)
 		}
 	}
 	if err != nil {
+		// 回滚 ② 取得的源引用（Acquire/Release 严格配对）
+		s.mgr.Release(dev, prof)
 		return &base.Response{StatusCode: base.StatusServiceUnavailable}, nil, nil
 	}
-	return &base.Response{StatusCode: base.StatusOK}, ss, nil
+	// ④ 记账：会话键集合 + viewers++。校验条目同一性——③④ 之间条目
+	// 被源停拆（OnSourceState）时不把引用记到陈旧条目上。
+	s.mu.Lock()
+	if cur, exists := s.streams[key]; exists && cur == e {
+		rec := s.sessions[ctx.Session]
+		if rec == nil {
+			rec = &sessionRec{keys: map[string]bool{}}
+			s.sessions[ctx.Session] = rec
+		}
+		rec.keys[key] = true
+		e.viewers++
+		s.mu.Unlock()
+		return &base.Response{StatusCode: base.StatusOK}, e.ss, nil
+	}
+	s.mu.Unlock()
+	// 条目在 ③④ 之间失效：回滚引用，503
+	s.mgr.Release(dev, prof)
+	return &base.Response{StatusCode: base.StatusServiceUnavailable}, nil, nil
 }
 
 func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	dev, prof, ok := parsePath(ctx.Path)
-	if !ok {
+	if _, _, ok := parsePath(ctx.Path); !ok {
 		return &base.Response{StatusCode: base.StatusNotFound}, nil
 	}
 	if !s.authorize(ctx.Request) {
 		return s.challenge(&base.Response{}), nil
 	}
 	s.mu.Lock()
-	if _, seen := s.sessions[ctx.Session]; !seen {
-		s.sessions[ctx.Session] = "rtsp:" + dev + "/" + string(prof)
+	rec, seen := s.sessions[ctx.Session]
+	first := seen && !rec.played
+	if first {
+		rec.played = true
 	}
 	s.mu.Unlock()
-	if s.hook != nil {
+	if first && s.hook != nil {
 		s.hook("rtsp", true)
 	}
 	return &base.Response{StatusCode: base.StatusOK}, nil
+}
+
+// OnSourceState 订阅媒体源状态变迁（app 经 Mgr.OnState 接线）：仅处理
+// StateStopped——使该设备该归一化 profile 的出口流条目失效。幂等；
+// 覆盖两类陈旧：DESCRIBE-only 的孤儿条目（viewers=0 无人负责拆除）
+// 与源重建后缓存的旧 SDP 条目。条目关闭会异步联动关闭其 reader
+// 会话，各自走 OnSessionClose 释放源引用。
+func (s *Server) OnSourceState(ss media.SourceState) {
+	if ss.State != media.StateStopped {
+		return
+	}
+	prof := s.mgr.NormProfile(ss.Profile)
+	key := ss.Device + "|" + string(prof)
+	s.mu.Lock()
+	s.closeEntryLocked(key, ss.Device, prof)
+	s.mu.Unlock()
 }
 
 // LoopbackURL builds the internal loopback source URL for ffmpeg

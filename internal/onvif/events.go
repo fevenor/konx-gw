@@ -1,6 +1,8 @@
 package onvif
 
 import (
+	"fmt"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -139,6 +141,83 @@ func (s *Server) unsubscribe(id string) {
 
 var reSubIDPath = regexp.MustCompile(`/onvif/events_service/([A-Za-z0-9\-]+)`)
 var reMsgLimit = regexp.MustCompile(`MessageLimit="(\d+)"`)
+var reMsgLimitElem = regexp.MustCompile(`<(?:[A-Za-z0-9]+:)?MessageLimit[^>]*>\s*(\d+)\s*</(?:[A-Za-z0-9]+:)?MessageLimit>`)
+var reTimeoutElem = regexp.MustCompile(`<(?:[A-Za-z0-9]+:)?Timeout[^>]*>\s*([^<]*)\s*</(?:[A-Za-z0-9]+:)?Timeout>`)
+
+// reXSDDuration 匹配 xs:duration 的日/时/分/秒组合（P1DT2H3M4.5S）。
+var reXSDDuration = regexp.MustCompile(`^(-)?P(?:(\d+)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
+
+// parseXSDDuration 解析 ISO8601/xs:duration 时长（PnDTnHnMnS，支持
+// 小数秒），不识别的形态返回错误。
+func parseXSDDuration(s string) (time.Duration, error) {
+	m := reXSDDuration.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, fmt.Errorf("invalid xs:duration %q", s)
+	}
+	if m[2] == "" && m[3] == "" && m[4] == "" && m[5] == "" {
+		return 0, fmt.Errorf("empty xs:duration %q", s)
+	}
+	if strings.Contains(m[0], "T") && m[3] == "" && m[4] == "" && m[5] == "" {
+		// "P1DT" 之类：声明了时间部分却没有任何时间分量，非法
+		return 0, fmt.Errorf("missing time components in %q", s)
+	}
+	neg := m[1] == "-"
+	num := func(str string) float64 {
+		v, _ := strconv.ParseFloat(str, 64)
+		return v
+	}
+	d := time.Duration(num(m[2]) * float64(24*time.Hour))
+	d += time.Duration(num(m[3]) * float64(time.Hour))
+	d += time.Duration(num(m[4]) * float64(time.Minute))
+	d += time.Duration(num(m[5]) * float64(time.Second))
+	if neg {
+		d = -d
+	}
+	return d, nil
+}
+
+// maxPullWait 是 PullMessages 长轮询等待上限：该请求同步占用一条
+// HTTP 连接直至有消息或超时，上限 30s 避免连接被长时间钉死
+// （同时也是订阅清理周期的量级），ONVIF 允许服务端自行限定。
+const maxPullWait = 30 * time.Second
+
+// warnLog 记录警告日志；Env 未注入 Logger 时退回默认日志器，保证
+// 测试与轻量嵌入场景可用。
+func (s *Server) warnLog(msg string, args ...any) {
+	log := s.env.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Warn(msg, args...)
+}
+
+// pullWait 解析 PullMessages 请求的等待时长：优先元素式
+// <tev:Timeout>，回退属性式 Timeout="..."。解析失败或非正值时回
+// 到默认 5s 并记录日志；超过上限时不静默丢值，钳制到 30s 并记录。
+func (s *Server) pullWait(body string) time.Duration {
+	const defaultWait = 5 * time.Second
+	raw := ""
+	if m := reTimeoutElem.FindStringSubmatch(body); m != nil {
+		raw = m[1]
+	} else if m := reTimeout.FindStringSubmatch(body); m != nil {
+		raw = m[1]
+	}
+	if raw == "" {
+		return defaultWait
+	}
+	d, err := parseXSDDuration(raw)
+	if err != nil || d <= 0 {
+		s.warnLog("onvif pullmessages: 无法解析的 Timeout，使用默认等待",
+			"timeout", raw, "err", err, "default", defaultWait.String())
+		return defaultWait
+	}
+	if d > maxPullWait {
+		s.warnLog("onvif pullmessages: Timeout 超过上限，已钳制",
+			"timeout", raw, "capped_to", maxPullWait.String())
+		return maxPullWait
+	}
+	return d
+}
 
 func (s *Server) pullMessages(w http.ResponseWriter, r *http.Request, body string) {
 	// subscription id from Address element or path
@@ -159,15 +238,14 @@ func (s *Server) pullMessages(w http.ResponseWriter, r *http.Request, body strin
 		return
 	}
 
-	// honor the requested wait (cap 30s) for at least one message
-	timeout := 5 * time.Second
-	if m := reTimeout.FindStringSubmatch(body); m != nil {
-		if d, err := time.ParseDuration(strings.ToLower(strings.ReplaceAll(m[1], "PT", ""))); err == nil && d > 0 && d < 30*time.Second {
-			timeout = d
-		}
-	}
+	// honor the requested wait (capped at maxPullWait) for at least one message
+	timeout := s.pullWait(body)
 	limit := 20
-	if m := reMsgLimit.FindStringSubmatch(body); m != nil {
+	if m := reMsgLimitElem.FindStringSubmatch(body); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			limit = n
+		}
+	} else if m := reMsgLimit.FindStringSubmatch(body); m != nil {
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
 			limit = n
 		}
@@ -222,10 +300,21 @@ func (s *Server) messagesBody(evs []events.Event) string {
 	return b.String()
 }
 
+// defaultDoorbellTopic 是 onvif.topics 未配置（含空数组）时的安全
+// 回落值，与 config 默认值保持一致。
+const defaultDoorbellTopic = "tns1:Doorbell/Stimulus"
+
 // topicFor maps event types to configured ONVIF topics.
 func (s *Server) topicFor(ev events.Event) (topic, value string) {
 	switch ev.Type {
 	case events.TypeDoorbellPress:
+		// topics 允许配置为空数组（YAML `topics: []`）。该回调经
+		// 事件总线在推送读协程内执行，当前无 recover 保护，直接
+		// 下标访问会 panic 拖垮整个进程，因此空配置时回落到安全
+		// 默认 topic（保证门铃事件继续下发），而不是崩溃或丢弃。
+		if len(s.env.Cfg.ONVIF.Topics) == 0 {
+			return defaultDoorbellTopic, "true"
+		}
 		return s.env.Cfg.ONVIF.Topics[0], "true"
 	case events.TypeDeviceCalling:
 		return "tns1:VideoSource/MotionAlarm", "true"

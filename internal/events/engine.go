@@ -3,10 +3,14 @@
 package events
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fevenor/konx-gw/internal/cloud"
@@ -231,6 +235,9 @@ type Engine struct {
 	store *Store
 	bus   *Bus
 	dedup *dedup
+	// insertFailures 统计事件入库失败次数（磁盘满/锁超时等），
+	// 供后续监控指标接入；成功路径不触碰。
+	insertFailures atomic.Int64
 }
 
 func NewEngine(reg *Registry, store *Store) *Engine {
@@ -270,10 +277,19 @@ func (e *Engine) Submit(ev Event) {
 	if e.dedup.seen(ev) {
 		return
 	}
-	if err := e.store.Insert(&ev); err == nil {
-		e.bus.Publish(ev)
+	if err := e.store.Insert(&ev); err != nil {
+		// 入库失败（磁盘满/锁超时等）必须显式记录并计数，
+		// 绝不静默吞掉（门铃按键无痕丢失不可接受）
+		e.insertFailures.Add(1)
+		slog.Default().Error("事件入库失败，该事件未广播",
+			"device", ev.DeviceID, "type", ev.Type, "msg_id", ev.MsgID, "err", err)
+		return
 	}
+	e.bus.Publish(ev)
 }
+
+// InsertFailures 返回事件入库失败的累计次数（供监控指标接入）。
+func (e *Engine) InsertFailures() int64 { return e.insertFailures.Load() }
 
 // Subscribe registers a fan-out receiver; returns a cancel func.
 func (e *Engine) Subscribe(fn Subscriber) func() {
@@ -310,6 +326,9 @@ func newDedup(w time.Duration, max int) *dedup {
 	return d
 }
 
+// 二次去重判重依据：窗口内仅当「设备 + 事件类型 + 载荷指纹」完全一致
+// 才判重；载荷（含 msg_id）不同即视为新事件放行——快速双击门铃的两次
+// 真实按键推送 msg_id 不同，不应被 3s 窗口误吞。MsgID 一级去重不变。
 func (d *dedup) seen(ev Event) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -319,12 +338,24 @@ func (d *dedup) seen(ev Event) bool {
 		}
 		d.msgIDs[ev.MsgID] = time.Now()
 	}
-	key := ev.DeviceID + "|" + ev.Type
+	key := ev.DeviceID + "|" + ev.Type + "|" + payloadFingerprint(ev)
 	if _, ok := d.recent[key]; ok {
 		return true
 	}
 	d.recent[key] = time.Now()
 	return false
+}
+
+// payloadFingerprint 计算载荷指纹：只取 Payload 摘要（不含 msg_id——
+// 同一物理事件的重发 msg_id 可能不同而载荷相同，仍需判重）；payload 为
+// 空时返回空串，保持空载荷事件的窗口判重行为与旧实现一致。真实双击的
+// 两次按键载荷存在差异（计数/时间戳等），指纹不同即放行。
+func payloadFingerprint(ev Event) string {
+	if ev.Payload == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(ev.Payload))
+	return hex.EncodeToString(sum[:8])
 }
 
 // Local event helpers used by other modules.

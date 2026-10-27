@@ -160,6 +160,14 @@ type Session struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
+	// Run/Stop 幂等与竞态闭合（mu 保护）：runStarted 标记 Run 是否已
+	// 启动；stopRequested 允许「Stop 先于 Run」的时序下 Run 直接落
+	// 终态；doneOnce 保证 done 恰好被关闭一次（Run 与 Stop 都可能
+	// 关闭它）。
+	runStarted    bool
+	stopRequested bool
+	doneOnce      sync.Once
+
 	// test hooks (nil in production)
 	dialTransport func(dst *net.UDPAddr) (Transport, error)
 	queryList     func(ctx context.Context, host string, term uint64) ([]list.Server, error)
@@ -224,10 +232,31 @@ func (s *Session) setState(to State) {
 	}
 }
 
-// Run blocks until ctx is cancelled, maintaining the session.
+// Run blocks until ctx is cancelled, maintaining the session. 幂等：
+// 重复调用直接返回；Stop 先行调用（stopRequested）则立即落终态。
 func (s *Session) Run(ctx context.Context) {
-	defer close(s.done)
+	s.mu.Lock()
+	if s.runStarted || s.stopRequested {
+		already := s.runStarted
+		s.mu.Unlock()
+		if !already { // 未启动即退出：代为关闭 done 并落终态
+			s.finishStopped()
+		}
+		return
+	}
+	s.runStarted = true
+	s.mu.Unlock()
+	defer s.doneOnce.Do(func() { close(s.done) })
 	ctx, s.cancel = context.WithCancel(ctx)
+	// 竞态兜底：Stop 可能在上面临界区之后、cancel 赋值之前的窗口进入
+	//（此时 Stop 读到的 cancel 为 nil，只能置 stopRequested 并等待
+	// done）——此处补查并自我取消，保证 Stop 的等待有界。
+	s.mu.Lock()
+	stopped := s.stopRequested
+	s.mu.Unlock()
+	if stopped {
+		s.cancel()
+	}
 	for {
 		if ctx.Err() != nil {
 			s.setState(StateStopped)
@@ -267,12 +296,38 @@ func (s *Session) Run(ctx context.Context) {
 	}
 }
 
-// Stop cancels the session and waits for Run to return.
+// finishStopped 关闭 done（幂等）并落 stopped 终态（mu 外调用安全）。
+func (s *Session) finishStopped() {
+	s.doneOnce.Do(func() { close(s.done) })
+	s.setState(StateStopped)
+}
+
+// Stop cancels the session and waits for Run to return. 幂等安全：Run
+// 从未启动时不阻塞——直接代为关闭 done 并落终态返回（原先 <-done
+// 会永久挂起）；Stop 先于 Run 调用时，随后的 Run 立即落终态退出。
 func (s *Session) Stop() {
-	if s.cancel != nil {
-		s.cancel()
+	s.mu.Lock()
+	cancel := s.cancel
+	started := s.runStarted
+	s.stopRequested = true
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	<-s.done
+	if started {
+		<-s.done
+		return
+	}
+	// Run 未启动：无 goroutine 持有 done 的关闭义务，这里代为收尾。
+	finish := true
+	s.mu.Lock()
+	if s.runStarted { // 竞态兜底：Run 恰在本检查前启动——交还关闭权
+		finish = false
+	}
+	s.mu.Unlock()
+	if finish {
+		s.finishStopped()
+	}
 }
 
 // runOnce performs one full connect cycle; returns error to trigger reconnect.
@@ -311,7 +366,7 @@ func (s *Session) runOnce(ctx context.Context) error {
 	s.curTr = transport
 	s.mu.Unlock()
 	// 重连（runOnce 退出）时先停 AV 呼叫再关传输：避免悬挂半会话
-	// （AV Stop 的 CLOSE×3 挂断经同一 socket 发出）。
+	// （AV Stop 的 CLOSE 挂断经同一 socket 发出）。
 	defer func() {
 		s.mu.Lock()
 		c := s.avCaller
@@ -378,7 +433,17 @@ func (s *Session) loop(ctx context.Context, t Transport, fb *frame.Builder) erro
 			}
 			missedHearts++
 			if missedHearts >= 3 {
-				return fmt.Errorf("heartbeat lost x%d", missedHearts)
+				// session_hold 暂停期豁免判死：暂停中设备媒体静默、
+				// 服务器也可能不回心跳（呼叫态实测停应答），无流量
+				// 不能证明链路死亡；此时重连反而拆掉保持中的链路
+				//（重呼有 15-30 分钟节流窗代价）。真断链由设备
+				// CLOSE/REJECT（TLV3 终结 → caller closed）或 Resume
+				// 后的流量判定兜底恢复。
+				if !s.avHoldPaused() {
+					return fmt.Errorf("heartbeat lost x%d", missedHearts)
+				}
+				// 暂停期保持计数不清零：Resume 后首个心跳周期即可
+				// 正常判死真断链（计数仍在增长，恢复判定无延迟）。
 			}
 		default:
 		}
@@ -465,6 +530,15 @@ func (s *Session) loop(ctx context.Context, t Transport, fb *frame.Builder) erro
 	}
 }
 
+// avHoldPaused 报告 AV 呼叫是否处 session_hold 暂停态（心跳判死豁免
+// 依据，见 loop）。无呼叫挂载时恒 false。
+func (s *Session) avHoldPaused() bool {
+	s.mu.Lock()
+	avc := s.avCaller
+	s.mu.Unlock()
+	return avc != nil && avc.State() == av.StatePaused
+}
+
 // decodeNotify splits the notify body into message name + JSON body.
 // Two live-observed shapes:
 //
@@ -474,9 +548,22 @@ func (s *Session) loop(ctx context.Context, t Transport, fb *frame.Builder) erro
 //
 // The parser is structural: find the JSON '{', walk back over printable
 // ASCII to recover the name; binary-only bodies keep their leading run.
+//
+// 边界规则：
+//   - 纯 JSON 体（'{' 在首字节）：无名字段——JSON 取整个 body，
+//     不得把整串 JSON 误当 Name 回退；
+//   - 名字长度不设下限：短名（<3 字符）同样有效，仅要求非空且 JSON
+//     合法；
+//   - 无有效 JSON 的回退：取首段连续可打印 ASCII 为名，前导二进制
+//     字节处自然截断，且上限 64B——防畸形体的超长垃圾灌入 Name。
 func decodeNotify(n *frame.Notify) Notify {
 	out := Notify{MsgID: n.MsgID, SrcID: n.SrcID, Body: n.Body}
-	if jsonStart := bytes.IndexByte(n.Body, '{'); jsonStart > 0 {
+	jsonStart := bytes.IndexByte(n.Body, '{')
+	if jsonStart == 0 {
+		out.JSON = strings.TrimRight(string(n.Body), "\x00")
+		return out
+	}
+	if jsonStart > 0 {
 		// name is the printable run ending just before the JSON, possibly
 		// separated by NUL(s) (live shape: <hdr>Name\0{json})
 		k := jsonStart
@@ -489,17 +576,16 @@ func decodeNotify(n *frame.Notify) Notify {
 		}
 		name := string(n.Body[j:k])
 		js := strings.TrimRight(string(n.Body[jsonStart:]), "\x00")
-		if len(name) >= 3 && json.Valid([]byte(js)) {
+		if len(name) > 0 && json.Valid([]byte(js)) {
 			out.Name, out.JSON = name, js
+			return out
 		}
 	}
-	if out.Name == "" && len(n.Body) > 0 {
-		end := 0
-		for end < len(n.Body) && n.Body[end] >= 0x20 && n.Body[end] < 0x7F {
-			end++
-		}
-		out.Name = string(n.Body[:end])
+	end := 0
+	for end < len(n.Body) && end < 64 && n.Body[end] >= 0x20 && n.Body[end] < 0x7F {
+		end++
 	}
+	out.Name = string(n.Body[:end])
 	return out
 }
 
@@ -611,7 +697,7 @@ func (s *Session) recvFrom(t Transport, timeout time.Duration) ([]byte, *net.UDP
 
 // AttachAV 建立并启动一路设备 AV 呼叫（内部建 Caller、挂 tap、Start）。
 // 要求会话 Ready（gute 管道已建立、云凭据在手）；重连周期退出时呼叫
-// 自动完整挂断（CLOSE×3+拆链）并释放 tap。同一时刻仅允许一路呼叫。
+// 自动完整挂断（CLOSE 单发+拆链）并释放 tap。同一时刻仅允许一路呼叫。
 func (s *Session) AttachAV(devID uint32, treatedPwd int) (*av.Caller, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

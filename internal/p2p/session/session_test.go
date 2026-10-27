@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -354,14 +355,14 @@ type sendToWrap struct{ *mockTransport }
 func (w sendToWrap) SendTo(b []byte, addr *net.UDPAddr) error { return w.Send(b) }
 
 // deviceMeterReq 构造 72B 设备 meter_req（0xc8 族，tap 必消费）。
-func deviceMeterReq(counter uint32) []byte {
+// linkID 必须与挂载呼叫一致：tap 消费以 link_id@+0x08 强归属校验
+// （杂散包不作会话活跃证据），测试注入须携带真实 linkID。
+func deviceMeterReq(linkID, counter uint32) []byte {
 	f := make([]byte, 72)
 	f[0], f[1] = 0xc8, 0x09
 	f[5] = 1
 	f[6] = 0x44
-	for i := 8; i < 12; i++ {
-		f[i] = byte(0x11)
-	}
+	binary.LittleEndian.PutUint32(f[8:12], linkID)
 	f[0x20] = byte(counter)
 	return f
 }
@@ -408,13 +409,15 @@ func TestSessionAVTrafficSuppressesHeartbeatLoss(t *testing.T) {
 	}
 
 	// 静默服务器一切应答（含心跳 ACK），仅持续注入设备 meter 包
+	//（携带真实 linkID：tap 以 link_id 强归属校验）
 	srv.tr.setOnSend(func(b []byte) {})
+	linkID, _ := c.IDs()
 	var deviceActive atomic.Bool
 	deviceActive.Store(true)
 	go func() {
 		var ctr uint32
 		for deviceActive.Load() {
-			srv.tr.push(deviceMeterReq(ctr))
+			srv.tr.push(deviceMeterReq(linkID, ctr))
 			ctr++
 			time.Sleep(30 * time.Millisecond)
 		}

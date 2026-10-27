@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fevenor/konx-gw/internal/api"
@@ -55,6 +56,8 @@ func Build(cfg *config.App, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// events.keep_raw 配置接线（默认 true 保持现状语义）
+	store.SetKeepRaw(cfg.Events.KeepRaw)
 	authSvc, err := auth.New(store, log)
 	if err != nil {
 		return nil, err
@@ -179,12 +182,36 @@ func Build(cfg *config.App, log *slog.Logger) (*App, error) {
 
 	// rtsp egress
 	lu, lp := authSvc.Loopback()
+	// rtspViewers 是当前 RTSP 出口观众数（rtspout hook 每会话恰一次
+	// up/down 配对触发）：0→1 时登记客户端，1→0 时注销，避免并发观众
+	// 互相误伤注册表。
+	var rtspViewers atomic.Int32
 	a.Rtsp = rtspout.New(cfg.RTSP.Listen, a.Mgr, authSvc, func(kind string, up bool) {
+		delta := int32(1)
+		if !up {
+			delta = -1
+		}
+		n := rtspViewers.Add(delta)
+		if n < 0 {
+			n = 0 // 防御：hook 配对异常时不允许负计数
+			rtspViewers.Store(0)
+		}
+		switch {
+		case up && n == 1:
+			// 首个观众到来：登记 RTSP 出口为活跃客户端
+			_ = store.UpsertClient("rtsp-egress", "rtsp", "", "")
+		case !up && n == 0:
+			// 最后一个观众离开：注销（置 inactive）
+			_ = store.CloseClient("rtsp-egress")
+		}
 		if a.API != nil {
 			a.API.BroadcastClientChange()
 		}
-	}, log, cfg.AdvertisedRTSPPort())
+	}, log)
 	a.Rtsp.DescribeWait = cfg.RTSP.DescribeWait
+	// 源停拆联动出口：StateStopped 时失效对应出口流条目（孤儿条目与
+	// 陈旧 SDP 缓存清理）
+	a.Mgr.OnState(a.Rtsp.OnSourceState)
 	_ = lu
 	_ = lp
 
@@ -259,6 +286,11 @@ func traceHook(cfg *config.App) func(dir string, ft byte, wire []byte) {
 
 // Run starts every subsystem and blocks until ctx is done.
 func (a *App) Run(ctx context.Context) error {
+	// 启动即清零客户端注册表残留：上次运行（含崩溃）来不及注销的
+	// active=1 行在本进程内不可能存活，直接置断开，保证注册表不失真。
+	if err := a.Store.SweepAllClientsInactive(); err != nil {
+		a.Log.Warn("清理客户端注册表残留失败", "err", err)
+	}
 	a.Eng.Submit(events.SystemEvent("startup", map[string]any{
 		"version": api.Version, "source": a.Cfg.Media.Source,
 	}))
@@ -300,14 +332,22 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	// retention loop
+	// retention loop（事件保留清理）+ 客户端注册表 TTL 兜底清理：
+	// - 事件清理每 24 小时一次（保留天数/行数上限）；
+	// - web 客户端僵尸行每 5 分钟扫一次（活跃 WS 连接由 ping 周期刷新
+	//   last_active，TTL 取 10 分钟不会误清；清理的是 CloseClient 丢失
+	//   的残留行，例如写库失败或异常路径）。
 	go func() {
+		clientSweep := time.NewTicker(5 * time.Minute)
+		defer clientSweep.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(24 * time.Hour):
 				_ = a.Store.Cleanup(a.Cfg.Events.RetentionDays, a.Cfg.Events.MaxRows)
+			case <-clientSweep.C:
+				_ = a.Store.SweepStaleClients(10 * time.Minute)
 			}
 		}
 	}()

@@ -71,6 +71,14 @@ type Options struct {
 	CallingRetry   time.Duration // CALLING 无 meter 交互的重发间隔（默认 6s，最多 3 次）
 	MeterTicks     int           // 我方 meter_req 发送上限（默认 200）
 	MeterTickEvery time.Duration // meter_req 节拍（默认 100ms，参考实现 20ms 档的保守值）
+
+	// LinkWatchdog 建链看门狗超时窗：呼叫发起到进入 streaming 的总
+	// 预算。0 = 按内部预算推导（meter 泵全预算 MeterTicks×MeterTickEvery
+	// + AvStreamCtl 18 次重发全预算 + 余量，默认配置 ≈28s）。真机形态
+	// CALLING→首帧 300-500ms，正常建链亚秒级、远小于该窗；被服务端
+	// 节流/无应答的病态链路超时后主动完整拆链走错误退避，避免会话
+	// 永停 calling 占死槽位。
+	LinkWatchdog time.Duration
 }
 
 // TapFunc 由 session 读循环调用：收到原始 UDP 包先给 tap，返回 true 表示
@@ -116,6 +124,10 @@ type Caller struct {
 
 	kcp     *kcpPair
 	ctlSent int
+
+	// linkWatch 建链看门狗（mu 保护）：呼叫发起后布防，进入 streaming
+	//（START）或会话拆除时撤防；超时未建链则 fail 完整拆链。
+	linkWatch *time.Timer
 
 	stream   TlvStream
 	annex    AnnexStream
@@ -254,6 +266,7 @@ func (c *Caller) Start(ctx context.Context) error {
 		c.mu.Lock()
 		c.callSent = time.Now()
 		c.mu.Unlock()
+		c.armLinkWatch() // 建链看门狗：病态链路兜底，防止永停 calling
 		go c.meterPump()
 		<-ctx.Done()
 		c.shutdown()
@@ -261,7 +274,7 @@ func (c *Caller) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop 完整挂断（CLOSE×3 + 拆链，v1 语义）并等待所有
+// Stop 完整挂断（CLOSE 单发 + 拆链，v1 语义）并等待所有
 // goroutine 结束。观众离开且无节流顾虑时用本方法；会话保持（不拆链、
 // 同链路复活）见 Pause/Resume。
 func (c *Caller) Stop() {
@@ -271,7 +284,9 @@ func (c *Caller) Stop() {
 	<-c.done
 }
 
-// shutdown 在 run goroutine 内执行拆除：非终止态时礼貌 CLOSE×3。
+// shutdown 在 run goroutine 内执行拆除：非终止态时礼貌 CLOSE 单发
+// （对齐官方客户端挂断形态：TLV3 经 KCP 直达设备，实测仅发一次，
+// 服务器侧不可见）。
 func (c *Caller) shutdown() {
 	// 拆除即停吞包：生产路径从不显式置位会导致 closed caller 的 tap 仍
 	// 消费 meter/KCP 包（handleRawPacket 的 stopped 早退形同虚设）。置位
@@ -280,18 +295,11 @@ func (c *Caller) shutdown() {
 	c.mu.Lock()
 	kp := c.kcp
 	terminal := c.terminal
+	c.stopLinkWatchLocked() // 会话拆除：撤看门狗（无论成败，不再触发）
 	c.mu.Unlock()
 	if kp != nil && !terminal && kp.ctl != nil {
 		f := BuildAvStreamCtl(c.sessionID, CmdClose, c.token, 0, 0)
-		for i := 0; i < 3; i++ {
-			if _, err := kp.ctl.Write(f); err != nil {
-				break
-			}
-			select {
-			case <-time.After(300 * time.Millisecond):
-			case <-c.ctxDone:
-			}
-		}
+		_, _ = kp.ctl.Write(f)
 	}
 	if kp != nil {
 		kp.close()
@@ -315,6 +323,13 @@ func (c *Caller) Pause() {
 	if c.paused.Swap(true) {
 		return
 	}
+	// 挂起进入边界：丢弃 annex 重组缓冲中的跨期半包——暂停前最后一
+	// 批 TLV4 可能滞留未完成 NAL（等下一起始码），若带入恢复期会与
+	// 新数据拼合成坏帧（Resume 后首帧花屏）。与在途 Feed 互斥：后者
+	// 持 mu 执行，且 paused 置位后新 TLV4 不再进缓冲，重置安全。
+	c.mu.Lock()
+	c.annex.Reset()
+	c.mu.Unlock()
 	// 唤醒等待中的重发循环，使其立即回循环头看到 paused 退出（至多
 	// 多发一次 cmd=1——设备对重复 cmd=1 幂等，实测）。
 	select {
@@ -337,10 +352,13 @@ func (c *Caller) Resume() {
 		return
 	}
 	// 复位本周期接受/舞蹈状态：ctl 循环跑到新的 ACCEPT 才停，舞蹈在
-	// 新 ACCEPT 上重放（dancer.observe 的一次性防重需重置）。
+	// 新 ACCEPT 上重放（dancer.observe 的一次性防重需重置）。恢复边
+	// 界再复位一次 annex（幂等防御）：确保不存在任何跨暂停期的半包
+	// 残留，恢复期首帧从干净的 NAL 边界开始。
 	c.mu.Lock()
 	c.accepted = false
 	c.dancer.fired = false
+	c.annex.Reset()
 	kp := c.kcp
 	c.mu.Unlock()
 	c.log.Info("AV resumed (cmd=1 re-issue)", "dev", c.devID)
@@ -374,6 +392,69 @@ func (c *Caller) goCtlLoop() {
 		}()
 		c.ctlLoop()
 	}()
+}
+
+// ---------------------------------------------------------------------------
+// 建链看门狗（link watchdog）
+// ---------------------------------------------------------------------------
+
+// linkWatchBudget 推导看门狗超时窗：meter 泵全预算（MeterTicks×
+// MeterTickEvery，默认 200×100ms=20s）+ AvStreamCtl 18 次重发全预算
+// （CtlPlan 17 个间隔 ≈6s）+ 2s 余量——覆盖"meter 门最迟开启 + ctl
+// 重发跑满"的最坏正常路径，不与现有周期打架；显式配置 LinkWatchdog>0
+// 时以配置为准（测试可注入短窗）。
+func (c *Caller) linkWatchBudget() time.Duration {
+	if c.opts.LinkWatchdog > 0 {
+		return c.opts.LinkWatchdog
+	}
+	var ctl time.Duration
+	for _, d := range CtlPlan() {
+		ctl += d
+	}
+	return c.opts.MeterTickEvery*time.Duration(c.opts.MeterTicks) + ctl + 2*time.Second
+}
+
+// armLinkWatch 布防建链看门狗：呼叫发起后若在预算窗内未进入 streaming
+// （真机形态 CALLING→首帧 300-500ms，正常建链远小于窗口，不会误杀），
+// 则主动完整拆链并让媒体源进入既有错误退避路径——被服务端节流/无
+// 应答时 Caller 不再永停 StateCalling（meterPump 20s 静默退出、ctlLoop
+// 预算耗尽仅打日志，二者都不拆链），槽位得以释放、后续 Acquire 能
+// 重新呼叫。
+func (c *Caller) armLinkWatch() {
+	budget := c.linkWatchBudget()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.linkWatch != nil {
+		c.linkWatch.Stop()
+	}
+	c.linkWatch = time.AfterFunc(budget, c.linkWatchFire)
+}
+
+// stopLinkWatchLocked 撤防看门狗（须持 mu）：建链成功（TLV3 START）或
+// 会话拆除（shutdown）时调用，保证不与正常流程竞态误杀。
+func (c *Caller) stopLinkWatchLocked() {
+	if c.linkWatch != nil {
+		c.linkWatch.Stop()
+		c.linkWatch = nil
+	}
+}
+
+// linkWatchFire 看门狗触发：仅当仍未建链成功（未 START）、未终结且
+// 未拆除时拆链。与 START/拆除的竞态由 mu 下的状态读取 + stopped 兜底：
+// 恰在触发前建链成功的会话不拆；fail/cancel 幂等，重复触发无害。
+func (c *Caller) linkWatchFire() {
+	c.mu.Lock()
+	started := c.started
+	terminal := c.terminal
+	c.linkWatch = nil
+	c.mu.Unlock()
+	if started || terminal || c.stopped.Load() {
+		return
+	}
+	budget := c.linkWatchBudget()
+	c.log.Warn("建链看门狗超时：预算窗内未进入 streaming，主动拆链走重拨退避",
+		"dev", c.devID, "state", c.State(), "budget", budget.String())
+	c.fail(fmt.Errorf("p2p 建链超时：%.0fs 内未进入 streaming（服务端节流或无应答）", budget.Seconds()))
 }
 
 // ---------------------------------------------------------------------------
@@ -433,23 +514,37 @@ func (c *Caller) meterPump() {
 // 入向：原始包 tap（session 读循环调用）
 // ---------------------------------------------------------------------------
 
+// handleRawPacket 入向原始包 tap（session 读循环调用）。消费即归本呼叫：
+// meter 族须 link_id@+0x08 与本呼叫一致、KCP 段须 conv 匹配本呼叫双
+// conv（ctl=linkID|0x80000000、file=linkID&0x7fffffff，均由 linkID 派生
+// 且每次呼叫随机抽取）——杂散/跨呼叫包不消费、交回 gute 解析路径自然
+// 丢弃。归属校验同时是会话心跳存活判定的依据：session 侧以「tap 消费」
+// 为流量活跃证据清零心跳失联计数，宽泛匹配会让无关包制造假活（永不
+// 重连），必须强归属（session M4）。
 func (c *Caller) handleRawPacket(pkt []byte, from *net.UDPAddr) bool {
 	if c.stopped.Load() {
 		return false
 	}
 	if sub, ok := ClassifyMeter(pkt); ok {
+		if len(pkt) < 12 || MeterLinkID(pkt) != c.linkID {
+			return false // 杂散 meter 形态包：非本呼叫，不作活跃证据
+		}
 		c.onMeter(pkt, from, sub)
 		return true
 	}
 	if IsKcpFrame(pkt) {
 		if seg, ok := UnwrapKcp(pkt); ok {
+			conv := KcpConvOf(seg)
+			if conv != c.linkID|0x80000000 && conv != c.linkID&0x7fffffff {
+				return false // conv 不属于本呼叫：非本链路流量
+			}
 			c.mu.Lock()
 			kp := c.kcp
 			c.mu.Unlock()
 			if kp != nil {
 				kp.feed(seg, from)
 			}
-			// ctl 门未开时的 KCP 段也消费（gute 解析器不该看到它们）
+			// ctl 门未开时的本呼叫 KCP 段也消费（gute 解析器不该看到它们）
 			return true
 		}
 	}
@@ -576,9 +671,12 @@ func (c *Caller) HandleGute(p *frame.Parsed) bool {
 func (c *Caller) onForward(p *frame.Parsed) {
 	_ = c.tr.Send(c.fb.Ack(0x3a))
 	if len(p.Payload) >= 0x20 {
+		// Payload 自帧 +0x18 起，故 Payload+0x18/+0x1C 实读帧 +0x30/
+		// +0x34（出向 0x3A 布局的地址块区域，语义未实证），按实际
+		// 偏移如实标注诊断值，不冒充会话 id。
 		c.log.Info("SRV_FORWARD",
-			"sid_c0", fmt.Sprintf("0x%08x", le32(p.Payload[0x18:])),
-			"sid_c1", fmt.Sprintf("0x%08x", le32(p.Payload[0x1C:])))
+			"u32@frame+0x30", fmt.Sprintf("0x%08x", le32(p.Payload[0x18:])),
+			"u32@frame+0x34", fmt.Sprintf("0x%08x", le32(p.Payload[0x1C:])))
 	}
 	c.setState(StateForward, nil)
 	c.mu.Lock()
@@ -727,6 +825,7 @@ func (c *Caller) onTlv3Locked(fr TlvFrame) func(uint32) error {
 		return func(cmd uint32) error { return kp.danceSend(sid, cmd, tok, pwd) }
 	case CmdStart:
 		c.started = true
+		c.stopLinkWatchLocked() // 建链成功：撤看门狗（防误杀正常会话）
 		go c.setState(StateStreaming, nil)
 		return nil
 	case CmdReject:

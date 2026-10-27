@@ -4,6 +4,7 @@ package api
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,6 +50,30 @@ type Server struct {
 	wsMu    sync.Mutex
 	wsSeq   uint64
 	wsConns map[*wsConn]struct{}
+
+	// hlsMu 保护 hlsRefs：key=device|profile → hls-start 时 Acquire 得
+	// 到的源释放函数。hls-start 幂等（已登记不重复 Acquire），配套
+	// hls-stop 释放；修复旧实现每次 hls-start 丢弃 Acquire 的释放
+	// 函数导致源引用只增不减（源永不空闲停止）的泄漏。
+	hlsMu   sync.Mutex
+	hlsRefs map[string]func()
+
+	// snapMu 保护 snapLast：快照冷却缓存（M6，见 snapshotCooldown）。
+	snapMu   sync.Mutex
+	snapLast map[string]snapResult
+}
+
+// snapshotCooldown 服务端快照冷却窗（M6）：session_hold=false（默认）
+// 时每次快照 Acquire 都是一次完整 P2P 呼叫，而云端对高频呼叫有
+// 15-30 分钟节流惩罚窗——冷却窗内的重复请求直接返回最近一次结果
+// （成功回放缓存的 JPEG，失败回放 503），不再触发挥源/呼叫。
+const snapshotCooldown = 5 * time.Second
+
+// snapResult 是快照冷却缓存的一条记录。
+type snapResult struct {
+	jpg []byte
+	err error
+	at  time.Time
 }
 
 // StateSnapshot is the /api/state document and the WS state.changed body.
@@ -72,7 +97,13 @@ type DeviceState struct {
 }
 
 func New(d Deps) *Server {
-	s := &Server{d: d, mux: http.NewServeMux(), wsConns: map[*wsConn]struct{}{}}
+	s := &Server{
+		d:        d,
+		mux:      http.NewServeMux(),
+		wsConns:  map[*wsConn]struct{}{},
+		hlsRefs:  map[string]func(){},
+		snapLast: map[string]snapResult{},
+	}
 	s.routes()
 	return s
 }
@@ -85,7 +116,13 @@ func (s *Server) routes() {
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("ok"))
 	})
-	m.HandleFunc("/metrics", s.metrics)
+	// /metrics 与 API 同源鉴权（默认开启，web.metrics_auth 可关，供可信
+	// 内网抓取）；关闭后指标含设备/客户端规模信息，只应在隔离网络使用。
+	if s.metricsAuthEnabled() {
+		m.Handle("/metrics", A.Require(auth.ScopeRead, s.metrics))
+	} else {
+		m.HandleFunc("/metrics", s.metrics)
+	}
 
 	// state (also used by config_flow validation)
 	m.Handle("/api/state", A.Require(auth.ScopeRead, s.handleState))
@@ -105,6 +142,7 @@ func (s *Server) routes() {
 	m.Handle("/api/devices/{id}/stream.mjpeg", A.Require(auth.ScopeRead, s.handleMJPEG))
 	m.Handle("/api/devices/{id}/hls/{profile}/{file}", A.Require(auth.ScopeRead, s.handleHLSFile))
 	m.Handle("/api/devices/{id}/hls-start", A.Require(auth.ScopeRead, s.handleHLSStart))
+	m.Handle("/api/devices/{id}/hls-stop", A.Require(auth.ScopeRead, s.handleHLSStop))
 
 	// talk
 	m.Handle("/api/devices/{id}/talk/start", A.Require(auth.ScopeTalk, s.handleTalkStart))
@@ -142,6 +180,16 @@ func (s *Server) methodRouter(m map[string]http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// metricsAuthEnabled 报告 /metrics 是否要求鉴权；未配置（nil）默认
+// 开启，杜绝零值配置意外把指标暴露出去。
+func (s *Server) metricsAuthEnabled() bool {
+	if s.d.Cfg == nil {
+		return true
+	}
+	ma := s.d.Cfg.Web.MetricsAuth
+	return ma == nil || *ma
+}
+
 // Handler returns the root handler.
 func (s *Server) Handler() http.Handler { return s.mux }
 
@@ -177,13 +225,36 @@ func (s *Server) snapshot() StateSnapshot {
 	}
 	for _, d := range s.d.Cfg.Devices {
 		snap.Devices = append(snap.Devices, DeviceState{
-			ID: d.ID, Name: d.Name, Online: true, Source: s.d.Mgr.StateOf(d.ID),
+			ID: d.ID, Name: d.Name, Online: s.deviceOnline(d.ID), Source: s.d.Mgr.StateOf(d.ID),
 		})
 	}
 	if counts, err := s.d.Store.ClientCounts(); err == nil {
 		snap.Clients = counts
 	}
 	return snap
+}
+
+// deviceOnline 基于 Manager 的媒体源槽位状态推导设备在线（C2-4）：
+// 设备自身的在网/心跳上报要等 p2p-av 设备会话模块落地，当前取值语义
+// 见 onlineFromStates——简言之"任一 profile 的取流链路存活（含建立中
+// 与 session_hold 保持态）即在线"，无槽位/已拆链/源错误即离线。
+func (s *Server) deviceOnline(id string) bool {
+	return onlineFromStates(s.d.Mgr.StateOf(id))
+}
+
+// onlineFromStates 的取值语义：
+//   - starting：取流已发起（源握手/呼叫建立中）→ 在线；
+//   - active：媒体链路确认存活 → 在线；
+//   - paused：session_hold 保持态（链路未拆、可复活）→ 在线；
+//   - stopped（无槽位或已空闲拆链）/ error（源错误）→ 离线。
+func onlineFromStates(states map[media.Profile]media.State) bool {
+	for _, st := range states {
+		switch st {
+		case media.StateStarting, media.StateActive, media.StatePaused:
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +352,19 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("stream") == "sub" {
 		prof = media.ProfileSub
 	}
+	// 快照冷却（M6）：冷却窗内的重复请求直接回放最近一次结果，不再次
+	// Acquire——session_hold=false 默认下每次快照都是一次完整 P2P 呼叫，
+	// HA 侧轮询会撞上云端 15-30 分钟呼叫节流窗。
+	key := id + "|" + string(prof)
+	if res, ok := s.snapshotCacheGet(key); ok {
+		if res.err != nil {
+			writeJSONErr(w, 503, "snapshot_cooldown", res.err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		_, _ = w.Write(res.jpg)
+		return
+	}
 	rel, err := s.d.Mgr.Acquire(id, prof)
 	if err != nil {
 		writeJSONErr(w, 404, "not_found", err.Error())
@@ -299,11 +383,31 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if err != nil {
+		s.snapshotCachePut(key, snapResult{err: err, at: time.Now()})
 		writeJSONErr(w, 503, "snapshot_failed", err.Error())
 		return
 	}
+	s.snapshotCachePut(key, snapResult{jpg: jpg, at: time.Now()})
 	w.Header().Set("Content-Type", "image/jpeg")
 	_, _ = w.Write(jpg)
+}
+
+// snapshotCacheGet 取冷却窗内的最近一次快照结果；过期或无记录返回 miss。
+func (s *Server) snapshotCacheGet(key string) (snapResult, bool) {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	res, ok := s.snapLast[key]
+	if !ok || time.Since(res.at) >= snapshotCooldown {
+		return snapResult{}, false
+	}
+	return res, true
+}
+
+// snapshotCachePut 记录一次快照结果（成功缓存 JPEG，失败缓存错误）。
+func (s *Server) snapshotCachePut(key string, res snapResult) {
+	s.snapMu.Lock()
+	s.snapLast[key] = res
+	s.snapMu.Unlock()
 }
 
 func (s *Server) handleMJPEG(w http.ResponseWriter, r *http.Request) {
@@ -328,17 +432,56 @@ func (s *Server) handleHLSStart(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("stream") == "sub" {
 		prof = media.ProfileSub
 	}
-	if _, err := s.d.Mgr.Acquire(id, prof); err != nil {
+	key := id + "|" + string(prof)
+	playlist := fmt.Sprintf("/api/devices/%s/hls/%s/index.m3u8", id, prof)
+	lu, lp := s.d.Auth.Loopback()
+
+	// 整个"查重 → Acquire → Ensure → 登记"持锁完成：已登记（已启动）
+	// 直接幂等返回播放列表，不再重复 Acquire——旧实现每次调用都丢弃
+	// Acquire 返回的释放函数，源引用只增不减，源永不空闲停止（C1-2）。
+	s.hlsMu.Lock()
+	if _, ok := s.hlsRefs[key]; ok {
+		s.hlsMu.Unlock()
+		writeJSON(w, 200, map[string]string{"playlist": playlist})
+		return
+	}
+	rel, err := s.d.Mgr.Acquire(id, prof)
+	if err != nil {
+		s.hlsMu.Unlock()
 		writeJSONErr(w, 404, "not_found", err.Error())
 		return
 	}
-	lu, lp := s.d.Auth.Loopback()
-	key := id + "|" + string(prof)
 	if _, err := s.d.HLS.Ensure(key, s.d.Rtsp.LoopbackURL(id, prof, lu, lp)); err != nil {
+		rel() // HLS 起不来：立即归还刚取的源引用
+		s.hlsMu.Unlock()
 		writeJSONErr(w, 500, "hls_failed", err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]string{"playlist": fmt.Sprintf("/api/devices/%s/hls/%s/index.m3u8", id, prof)})
+	s.hlsRefs[key] = rel
+	s.hlsMu.Unlock()
+	writeJSON(w, 200, map[string]string{"playlist": playlist})
+}
+
+// handleHLSStop 是 hls-start 的配套释放端点：归还源引用并停掉 HLS
+// 管线（未启动时为无害的幂等操作）。
+func (s *Server) handleHLSStop(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	prof := media.ProfileMain
+	if r.URL.Query().Get("stream") == "sub" {
+		prof = media.ProfileSub
+	}
+	key := id + "|" + string(prof)
+	s.hlsMu.Lock()
+	rel, ok := s.hlsRefs[key]
+	delete(s.hlsRefs, key)
+	s.hlsMu.Unlock()
+	if ok {
+		rel()
+	}
+	if s.d.HLS != nil {
+		s.d.HLS.Stop(key)
+	}
+	writeJSON(w, 200, map[string]string{"status": "stopped"})
 }
 
 func (s *Server) handleHLSFile(w http.ResponseWriter, r *http.Request) {
@@ -360,7 +503,10 @@ func (s *Server) handleHLSFile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleTalkStart(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	_, err := s.d.Talk.Start(r.Context(), id, "api")
+	// 会话生命周期独立于本次 HTTP 请求（M5）：REST 触发的对讲不能随
+	// 响应返回而消亡，回收靠显式 talk/stop 或心跳看门狗超时。故传
+	// context.Background，不绑 r.Context()。
+	_, err := s.d.Talk.Start(context.Background(), id, "api")
 	if err != nil {
 		if err == talk.ErrUnavailable {
 			writeJSONErr(w, 501, "talk_unavailable", err.Error()+"; reason=awaiting_p2p_av_module")
@@ -384,10 +530,11 @@ func (s *Server) handleTalkAudio(w http.ResponseWriter, r *http.Request) {
 		writeJSONErr(w, 400, "bad_request", err.Error())
 		return
 	}
-	// accept audio/L16 raw or WAV (strip 44-byte header if present)
-	if len(body) > 44 && body[0] == 'R' && body[1] == 'I' && body[2] == 'F' && body[3] == 'F' {
-		body = body[44:]
-	}
+	// 接受 audio/L16 裸 PCM 或 WAV 容器：按 RIFF/WAVE chunk 遍历定位
+	// data 块后再剥离（旧实现固定剥 44 字节，遇到带 LIST/_fact 等附加
+	// 块的非标准头会把有效音频一起切掉）；非 WAV 数据（无 RIFF 魔数）
+	// 原样透传（M8）。
+	body = stripWAVHeader(body)
 	if err := s.d.Talk.WritePCM16(id, body); err != nil {
 		writeJSONErr(w, 409, "talk_failed", err.Error())
 		return
@@ -396,11 +543,41 @@ func (s *Server) handleTalkAudio(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
+// stripWAVHeader 解析 WAV（RIFF/WAVE）容器头并返回 data 块载荷：
+//   - 标准/非标准头长（fmt 之后跟 LIST、_fact 等附加块）都能正确剥离；
+//   - data 块声明长度异常（0 或越界，部分流式编码器如此）时取剩余全部；
+//   - 无 RIFF 魔数（裸 PCM 上传）或结构损坏时原样透传，交由下游处理。
+func stripWAVHeader(b []byte) []byte {
+	if len(b) < 12 || string(b[0:4]) != "RIFF" || string(b[8:12]) != "WAVE" {
+		return b
+	}
+	off := 12
+	for off+8 <= len(b) {
+		id := string(b[off : off+4])
+		size := int(binary.LittleEndian.Uint32(b[off+4 : off+8]))
+		off += 8
+		if id == "data" {
+			end := off + size
+			if size == 0 || end > len(b) {
+				end = len(b)
+			}
+			return b[off:end]
+		}
+		off += size
+		if size%2 == 1 {
+			off++ // RIFF chunk 按 2 字节对齐（奇数长度后有 1 填充字节）
+		}
+	}
+	return b
+}
+
 var talkUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 
 func (s *Server) handleTalkWS(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.d.Talk.Start(r.Context(), id, "web"); err != nil {
+	// 同 M5：会话生命周期跟 WS 连接走（下方 defer Stop），不绑请求 ctx。
+	sess, err := s.d.Talk.Start(context.Background(), id, "web")
+	if err != nil {
 		if err == talk.ErrUnavailable {
 			writeJSONErr(w, 501, "talk_unavailable", err.Error()+"; reason=awaiting_p2p_av_module")
 			return
@@ -414,11 +591,24 @@ func (s *Server) handleTalkWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.Close()
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		// ping loop keeps the session heartbeat alive
+		// 心跳保活循环（C1-1）：必须在连接关闭（done）、会话被停止或被
+		// 他人重建（Active 不再是本会话）时退出——旧实现 for+sleep 无
+		// 退出条件，每条 talk WS 连接泄漏一个常驻协程。
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
 		for {
-			time.Sleep(time.Second)
-			s.d.Talk.Ping(id)
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if s.d.Talk.Active(id) != sess {
+					return
+				}
+				s.d.Talk.Ping(id)
+			}
 		}
 	}()
 	for {
@@ -502,8 +692,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSONErr(w, 401, "bad_credentials", "wrong password")
 		return
 	}
-	// mint a short-lived session token (admin scope)
-	tok, err := s.d.Auth.CreateToken("web-session", []string{auth.ScopeAdmin})
+	// 铸造带 TTL 的网页登录会话令牌（admin 权限）：有效期由
+	// web.session_ttl 配置（默认 24h），到期在校验时惰性吊销——见
+	// auth.CreateSessionToken。旧实现铸造的是永久 admin 令牌且无清理。
+	tok, err := s.d.Auth.CreateSessionToken(s.d.Cfg.Web.SessionTTL)
 	if err != nil {
 		writeJSONErr(w, 500, "internal", err.Error())
 		return

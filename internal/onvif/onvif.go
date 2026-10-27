@@ -10,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -49,6 +51,12 @@ func New(env Env) *Server {
 	s.mux.HandleFunc("/onvif/device_service", s.soap(s.deviceService))
 	s.mux.HandleFunc("/onvif/media_service", s.soap(s.mediaService))
 	s.mux.HandleFunc("/onvif/events_service", s.soap(s.eventsService))
+	// PullPoint 订阅地址形如 /onvif/events_service/<id>：规范客户端
+	// 会按 CreatePullPointSubscription 应答里的 SubscriptionReference
+	// 地址直接 POST PullMessages，必须注册子树路由才能可达（只注册
+	// 精确路径会 404）；未知/失效 id 由 pullMessages 返回 SOAP
+	// SubscriptionReferenceFault，与订阅清理逻辑天然兼容。
+	s.mux.HandleFunc("/onvif/events_service/", s.soap(s.eventsService))
 	return s
 }
 
@@ -73,14 +81,20 @@ func (s *Server) soap(fn soapHandler) http.HandlerFunc {
 			}
 			// WS-UsernameToken is validated per-operation inside handlers
 		}
-		buf := make([]byte, 0, 64*1024)
-		tmp := make([]byte, 8192)
-		for {
-			n, err := r.Body.Read(tmp)
-			buf = append(buf, tmp[:n]...)
-			if err != nil {
-				break
+		// SOAP 请求体上限 1MB：常规 ONVIF 请求（含 UsernameToken
+		// 摘要、多 Profile 枚举）远小于 64KB，1MB 已留足余量；无上限
+		// 读取会被恶意超大体直接打爆网关内存。
+		const maxSOAPBody = 1 << 20
+		r.Body = http.MaxBytesReader(w, r.Body, maxSOAPBody)
+		buf, err := io.ReadAll(r.Body)
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
 			}
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
 		}
 		action := strings.Trim(r.Header.Get("SOAPAction"), `"' `)
 		fn(w, r, action, string(buf))

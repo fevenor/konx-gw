@@ -135,3 +135,53 @@ func TestCloudAppPackageOverride(t *testing.T) {
 		t.Fatalf("非法包名必须报错: %v", err)
 	}
 }
+
+// TestValidateWritesBackDevicePass（D2）：设备 rtsp.pass 缺省 "auto" 必须
+// 写回 c.Devices 本体——旧实现写在 range 副本上永不生效。
+func TestValidateWritesBackDevicePass(t *testing.T) {
+	c := Defaults()
+	c.Cloud.User = "u"
+	c.Cloud.PassMD5 = strings.Repeat("a", 32)
+	c.Media.Source = "off"
+	c.Devices = []Device{{ID: "10000001"}, {ID: "10000002"}}
+	c.Devices[1].RTSP.Pass = "secret"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("合法配置被拒: %v", err)
+	}
+	if c.Devices[0].RTSP.Pass != "auto" {
+		t.Fatalf("缺省密码未写回: %q（应 auto）", c.Devices[0].RTSP.Pass)
+	}
+	if c.Devices[1].RTSP.Pass != "secret" {
+		t.Fatalf("显式密码被覆盖: %q", c.Devices[1].RTSP.Pass)
+	}
+}
+
+// TestWebMetricsAuthAndSessionTTL：metrics_auth 默认 nil（= 开启鉴权）、
+// 环境变量可显式开关；session_ttl 默认 24h、环境变量可覆盖。
+func TestWebMetricsAuthAndSessionTTL(t *testing.T) {
+	c := Defaults()
+	if c.Web.MetricsAuth != nil {
+		t.Fatalf("metrics_auth 默认应为 nil（未配置=开启鉴权），得到 %v", *c.Web.MetricsAuth)
+	}
+	if c.Web.SessionTTL != 24*time.Hour {
+		t.Fatalf("session_ttl 默认应为 24h，得到 %v", c.Web.SessionTTL)
+	}
+
+	t.Setenv("KONX_WEB_METRICS_AUTH", "false")
+	t.Setenv("KONX_WEB_SESSION_TTL", "1h")
+	c2 := Defaults()
+	c2.applyEnv()
+	if c2.Web.MetricsAuth == nil || *c2.Web.MetricsAuth {
+		t.Fatal("KONX_WEB_METRICS_AUTH=false 应关闭指标鉴权")
+	}
+	if c2.Web.SessionTTL != time.Hour {
+		t.Fatalf("KONX_WEB_SESSION_TTL=1h 覆盖失效: %v", c2.Web.SessionTTL)
+	}
+
+	t.Setenv("KONX_WEB_METRICS_AUTH", "true")
+	c3 := Defaults()
+	c3.applyEnv()
+	if c3.Web.MetricsAuth == nil || !*c3.Web.MetricsAuth {
+		t.Fatal("KONX_WEB_METRICS_AUTH=true 应开启指标鉴权")
+	}
+}

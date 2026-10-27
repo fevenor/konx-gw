@@ -46,11 +46,19 @@ func (s *Server) deviceService(w http.ResponseWriter, r *http.Request, action, b
 			`<tds:HardwareId>konx-gw</tds:HardwareId>`+
 			`</tds:GetDeviceInformationResponse></s:Body>`)
 	case "GetCapabilities":
+		// 流能力字段必须是良构 XML：布尔能力以子元素形式表达
+		// （如 <tt:RTP_TCP>true</tt:RTP_TCP>），语义为支持 RTSP
+		// over TCP；此前把属性写进标签名的畸形写法会导致严格
+		// 解析器整体解析失败。
 		reply(w, `<s:Body><tds:GetCapabilitiesResponse><tds:Capabilities>`+
 			`<tt:Media><tt:XAddr>http://`+host+`:`+itoa(port)+`/onvif/media_service</tt:XAddr>`+
-			`<tt:StreamingCapabilities><tt:RTP_TCP="true" RTP_RTSP_TCP="true"/></tt:StreamingCapabilities></tt:Media>`+
+			`<tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast>`+
+			`<tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>`+
+			`<tt:NonAggregateControl>false</tt:NonAggregateControl>`+
+			`</tt:StreamingCapabilities></tt:Media>`+
 			`<tt:Events><tt:XAddr>http://`+host+`:`+itoa(port)+`/onvif/events_service</tt:XAddr>`+
-			`<tt:WSSubscriptionPolicySupport="false"/></tt:Events>`+
+			`<tt:WSSubscriptionPolicySupport>false</tt:WSSubscriptionPolicySupport>`+
+			`<tt:WSPullPointSupport>true</tt:WSPullPointSupport></tt:Events>`+
 			`<tt:Device><tt:XAddr>http://`+host+`:`+itoa(port)+`/onvif/device_service</tt:XAddr></tt:Device>`+
 			`</tds:Capabilities></tds:GetCapabilitiesResponse></s:Body>`)
 	case "GetSystemDateAndTime":

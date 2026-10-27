@@ -108,6 +108,10 @@ select{background:#0b0f18;color:var(--tx);border:1px solid var(--line);border-ra
 <script>
 let TOK = localStorage.getItem('konx_token') || '';
 let ws = null, wsTimer = null, curView = 'status';
+// 所有服务端/事件数据在拼入 HTML 前必须经此转义，防止存储型 XSS 窃取 token
+function escapeHtml(v){
+  return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 async function api(path, opts={}) {
   const r = await fetch(path, {...opts, headers: {...(opts.headers||{}), Authorization: 'Bearer '+TOK}});
@@ -151,18 +155,18 @@ async function refresh(){
     const ready = s.p2p === 'ready';
     pill(document.getElementById('p2pPill'), 'p2p '+s.p2p+(s.p2p_server?' · '+s.p2p_server:''), ready?'ok':(s.p2p==='disabled'?'mid':'down'));
     const g = document.getElementById('sesGrid');
-    g.innerHTML = `<div class="kv"><b>云登录</b><span>${s.cloud}</span></div>
-      <div class="kv"><b>推送会话</b><span>${s.p2p}</span></div>
-      <div class="kv"><b>P2P 服务器</b><span>${s.p2p_server||'-'}</span></div>
-      <div class="kv"><b>RTT</b><span>${s.p2p_rtt_ms||'-'} ms</span></div>
-      <div class="kv"><b>取流协议</b><span>${srcShort(s.source)}</span></div>
-      <div class="kv"><b>运行时长</b><span>${Math.floor(s.uptime/60)} min</span></div>
-      <div class="kv"><b>客户端</b><span>${Object.entries(s.clients||{}).map(([k,v])=>k+':'+v).join(' ')||'-'}</span></div>
-      <div class="kv"><b>版本</b><span>${s.version}</span></div>`;
+    g.innerHTML = `<div class="kv"><b>云登录</b><span>${escapeHtml(s.cloud)}</span></div>
+      <div class="kv"><b>推送会话</b><span>${escapeHtml(s.p2p)}</span></div>
+      <div class="kv"><b>P2P 服务器</b><span>${escapeHtml(s.p2p_server||'-')}</span></div>
+      <div class="kv"><b>RTT</b><span>${escapeHtml(s.p2p_rtt_ms||'-')} ms</span></div>
+      <div class="kv"><b>取流协议</b><span>${escapeHtml(srcShort(s.source))}</span></div>
+      <div class="kv"><b>运行时长</b><span>${escapeHtml(Math.floor(s.uptime/60))} min</span></div>
+      <div class="kv"><b>客户端</b><span>${escapeHtml(Object.entries(s.clients||{}).map(([k,v])=>k+':'+v).join(' ')||'-')}</span></div>
+      <div class="kv"><b>版本</b><span>${escapeHtml(s.version)}</span></div>`;
     const dev = s.devices?.[0];
     document.getElementById('devBox').innerHTML = (s.devices||[]).map(d=>`
-      <table><tr><td><b>${d.name}</b> <span class="badge">${d.id}</span></td>
-      <td>主源 ${d.source?.main||'-'} / 子源 ${d.source?.sub||'-'}</td></tr></table>`).join('') || '<p class="muted">未配置设备</p>';
+      <table><tr><td><b>${escapeHtml(d.name)}</b> <span class="badge">${escapeHtml(d.id)}</span></td>
+      <td>主源 ${escapeHtml(d.source?.main||'-')} / 子源 ${escapeHtml(d.source?.sub||'-')}</td></tr></table>`).join('') || '<p class="muted">未配置设备</p>';
     if (dev) {
       const sel = document.getElementById('devSel');
       if (!sel.options.length) { (s.devices||[]).forEach(d => sel.add(new Option(d.name, d.id))); }
@@ -173,11 +177,12 @@ const SCOPE_LABEL = {device:'设备', cloud:'账号/云端', gw:'网关'};
 const SCOPE_CLS = {device:'doorbell', cloud:'', gw:'err'};
 function scopeBadge(e){
   const sc = e.scope || (e.device_id==='cloud'?'cloud':(e.device_id==='gw'?'gw':'device'));
-  return `<span class="badge ${SCOPE_CLS[sc]||''}">${SCOPE_LABEL[sc]||sc}</span>`;
+  // sc 经对象查表后才落入 class；标签文本兜底值必须转义
+  return `<span class="badge ${SCOPE_CLS[sc]||''}">${escapeHtml(SCOPE_LABEL[sc]||sc)}</span>`;
 }
 function srcLabel(e){
   if ((e.scope||'')==='device' || ['doorbell.press','device.alarm','device.calling','device.online','device.offline'].includes(e.type))
-    return e.device_name ? `${e.device_name} <span class="muted">(${e.device_id})</span>` : e.device_id;
+    return e.device_name ? `${escapeHtml(e.device_name)} <span class="muted">(${escapeHtml(e.device_id)})</span>` : escapeHtml(e.device_id);
   if (e.device_id==='cloud') return '云平台会话';
   return '网关自身';
 }
@@ -187,12 +192,12 @@ async function loadEvents(){
   const r = await api('/api/events?limit=100'+(t?'&type='+t:'')+(sc?'&scope='+sc:'')); if(!r.ok) return;
   const j = await r.json();
   const rows = (j.events||[]).map(e => `<tr>
-    <td>${fmtTs(e.ts_recv)}</td>
+    <td>${escapeHtml(fmtTs(e.ts_recv))}</td>
     <td>${scopeBadge(e)}</td>
     <td>${srcLabel(e)}</td>
-    <td><span class="badge ${e.type==='doorbell.press'?'doorbell':(e.type==='unknown'?'unknown':'')}">${e.type}</span></td>
-    <td>${e.msg_id||'-'}</td>
-    <td class="muted">${e.type==='unknown' ? `<a href="#" onclick="showRaw(${e.id});return false">查看原始载荷</a>` : (e.payload||'').slice(0,60)}</td></tr>`).join('');
+    <td><span class="badge ${e.type==='doorbell.press'?'doorbell':(e.type==='unknown'?'unknown':'')}">${escapeHtml(e.type)}</span></td>
+    <td>${escapeHtml(e.msg_id||'-')}</td>
+    <td class="muted">${e.type==='unknown' ? `<a href="#" onclick="showRaw(${Number(e.id)});return false">查看原始载荷</a>` : escapeHtml((e.payload||'').slice(0,60))}</td></tr>`).join('');
   document.getElementById('evBody').innerHTML = rows || '<tr><td colspan="6" class="muted">暂无事件</td></tr>';
   document.getElementById('evCount').textContent = (j.events||[]).length + ' 条';
 }
@@ -204,8 +209,8 @@ async function loadClients(){
   const r = await api('/api/clients'); if(!r.ok) return;
   const j = await r.json();
   document.getElementById('clBody').innerHTML = (j.clients||[]).map(c=>`<tr>
-    <td><span class="badge">${c.kind}</span></td><td>${c.peer||c.id}</td><td>${c.user||''}</td>
-    <td>${fmtTs(c.connected_at)}</td><td>${fmtTs(c.last_active)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无客户端</td></tr>';
+    <td><span class="badge">${escapeHtml(c.kind)}</span></td><td>${escapeHtml(c.peer||c.id)}</td><td>${escapeHtml(c.user||'')}</td>
+    <td>${escapeHtml(fmtTs(c.connected_at))}</td><td>${escapeHtml(fmtTs(c.last_active))}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无客户端</td></tr>';
 }
 // 取流来源标签：协议优先，任何状态下都直接回答"这是 P2P 还是 RTSP"
 const SRC_LABEL = {

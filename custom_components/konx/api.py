@@ -36,6 +36,18 @@ class KonxClient:
             resp.raise_for_status()
             return await resp.json()
 
+    async def events(self, since: int = 0, limit: int = 200) -> list[dict[str, Any]]:
+        """查询事件（REST 补拉通道，返回最新在前，与 /api/ws 的 since 同语义）。"""
+        session = await self._ensure_session()
+        async with session.get(
+            self.base + API_EVENTS,
+            headers=self.headers,
+            params={"since": str(since), "limit": str(limit)},
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("events", [])
+
     async def snapshot_jpeg(self, device_id: str, stream: str = "main") -> bytes | None:
         session = await self._ensure_session()
         try:
@@ -77,15 +89,23 @@ class KonxClient:
         ) as resp:
             return resp.status == 200
 
-    async def listen_events(self, on_event: Callable[[dict], None]) -> None:
-        """Long-lived websocket with exponential backoff reconnect."""
+    async def listen_events(
+        self, on_event: Callable[[dict], None], since: int | None = None
+    ) -> None:
+        """Long-lived websocket with exponential backoff reconnect.
+
+        since: 断线补拉游标（最后收到的事件 id）。重连时经 ?since= 让
+        网关回放断线期间的事件，避免门铃按键丢失。
+        """
         backoff = 2
         while True:
             try:
                 session = await self._ensure_session()
                 ws_url = self.base.replace("http", "ws") + WS_PATH
+                if since is not None:
+                    ws_url += f"?since={since}"
                 async with session.ws_connect(ws_url, headers=self.headers) as ws:
-                    _LOGGER.debug("konx-gw websocket connected")
+                    _LOGGER.debug("konx-gw websocket connected (since=%s)", since)
                     backoff = 2
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:

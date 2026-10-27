@@ -9,6 +9,20 @@ import (
 )
 
 var reProfileToken = regexp.MustCompile(`ProfileToken="([^"]*)"`)
+var reProfileTokenElem = regexp.MustCompile(`<(?:[A-Za-z0-9]+:)?ProfileToken[^>]*>\s*([^<]*?)\s*</(?:[A-Za-z0-9]+:)?ProfileToken>`)
+
+// profileTokenOf 提取 ProfileToken：优先 XML 元素式
+// <trt:ProfileToken>token</trt:ProfileToken>（规范形态，命名空间
+// 前缀任意或缺省），回退属性式 ProfileToken="token"（兼容旧客户端）。
+func profileTokenOf(body string) (string, bool) {
+	if m := reProfileTokenElem.FindStringSubmatch(body); m != nil {
+		return m[1], true
+	}
+	if m := reProfileToken.FindStringSubmatch(body); m != nil {
+		return m[1], true
+	}
+	return "", false
+}
 
 // mediaService handles /onvif/media_service: GetProfiles / GetProfile /
 // GetStreamUri / GetSnapshotUri / GetVideoEncoderConfigurations.
@@ -22,17 +36,14 @@ func (s *Server) mediaService(w http.ResponseWriter, r *http.Request, action, bo
 	case "GetProfiles":
 		s.getProfiles(w, r)
 	case "GetProfile":
-		tok := firstGroup(reProfileToken, body)
-		dev, prof, ok := s.parseToken(tok)
+		dev, prof, ok := s.requireProfile(w, body)
 		if !ok {
-			soapFault(w, "s:Sender", "ter:InvalidArgVal", "unknown profile token")
 			return
 		}
 		reply(w, profileBody(dev, prof, s.videoEncoderXML(dev, prof)))
 	case "GetStreamUri":
-		dev, prof, ok := s.parseToken(firstGroup(reProfileToken, body))
+		dev, prof, ok := s.requireProfile(w, body)
 		if !ok {
-			soapFault(w, "s:Sender", "ter:InvalidArgVal", "unknown profile token")
 			return
 		}
 		uri := s.env.StreamURL(dev, prof)
@@ -41,9 +52,8 @@ func (s *Server) mediaService(w http.ResponseWriter, r *http.Request, action, bo
 			`<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot><tt:Timeout>PT60S</tt:Timeout>`+
 			`</tt:MediaUri></tmv:GetStreamUriResponse></s:Body>`)
 	case "GetSnapshotUri":
-		dev, prof, ok := s.parseToken(firstGroup(reProfileToken, body))
+		dev, prof, ok := s.requireProfile(w, body)
 		if !ok {
-			soapFault(w, "s:Sender", "ter:InvalidArgVal", "unknown profile token")
 			return
 		}
 		uri := s.env.SnapshotURL(dev, prof)
@@ -52,7 +62,14 @@ func (s *Server) mediaService(w http.ResponseWriter, r *http.Request, action, bo
 			`<tt:InvalidAfterReboot>true</tt:InvalidAfterReboot><tt:Timeout>PT5S</tt:Timeout>`+
 			`</tt:MediaUri></tmv:GetSnapshotUriResponse></s:Body>`)
 	case "GetVideoEncoderConfigurations":
-		dev, prof, _ := s.parseToken(firstGroup(reProfileToken, body))
+		// 该操作规范上不携带 ProfileToken：有 token 且可解析则按
+		// 其定位，否则回退第一台配置设备主码流。
+		dev, prof := s.firstDeviceProfile()
+		if tok, found := profileTokenOf(body); found {
+			if d, p, ok := lookupProfileToken(tok); ok {
+				dev, prof = d, p
+			}
+		}
 		reply(w, `<s:Body><tmv:GetVideoEncoderConfigurationsResponse>`+
 			s.videoEncoderXML(dev, prof)+`</tmv:GetVideoEncoderConfigurationsResponse></s:Body>`)
 	case "GetServiceCapabilities":
@@ -69,15 +86,10 @@ func (s *Server) mediaService(w http.ResponseWriter, r *http.Request, action, bo
 	}
 }
 
-func firstGroup(re *regexp.Regexp, s string) string {
-	if m := re.FindStringSubmatch(s); m != nil {
-		return m[1]
-	}
-	return ""
-}
-
 // token layout: profile_<device>_<main|sub>
-func (s *Server) parseToken(tok string) (string, media.Profile, bool) {
+// lookupProfileToken 纯解析 profile token，不做任何设备回退；
+// 解析失败返回 ok=false，由调用方决定是否报错。
+func lookupProfileToken(tok string) (string, media.Profile, bool) {
 	if i := strings.Index(tok, "profile_"); i >= 0 {
 		rest := tok[i+len("profile_"):]
 		if j := strings.LastIndex(rest, "_"); j > 0 {
@@ -88,11 +100,33 @@ func (s *Server) parseToken(tok string) (string, media.Profile, bool) {
 			}
 		}
 	}
-	// default: first configured device, main
-	for _, d := range s.env.Cfg.Devices {
-		return d.ID, media.ProfileMain, true
-	}
 	return "", "", false
+}
+
+// requireProfile 解析请求中的 ProfileToken；元素式/属性式均可。未
+// 提供或无法解析时返回明确 SOAP 错误（多设备环境下静默回退第一台
+// 会导致客户端拉错流），解析成功才返回设备与档位。
+func (s *Server) requireProfile(w http.ResponseWriter, body string) (string, media.Profile, bool) {
+	tok, found := profileTokenOf(body)
+	if !found || tok == "" {
+		soapFault(w, "s:Sender", "ter:InvalidArgVal", "missing profile token")
+		return "", "", false
+	}
+	dev, prof, ok := lookupProfileToken(tok)
+	if !ok {
+		soapFault(w, "s:Sender", "ter:InvalidArgVal", "unknown profile token: "+tok)
+		return "", "", false
+	}
+	return dev, prof, true
+}
+
+// firstDeviceProfile 回退到第一台配置设备的主码流（用于规范上不携
+// 带 ProfileToken 的操作）。
+func (s *Server) firstDeviceProfile() (string, media.Profile) {
+	for _, d := range s.env.Cfg.Devices {
+		return d.ID, media.ProfileMain
+	}
+	return "", media.ProfileMain
 }
 
 func (s *Server) getProfiles(w http.ResponseWriter, r *http.Request) {

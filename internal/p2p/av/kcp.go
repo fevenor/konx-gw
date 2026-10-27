@@ -112,17 +112,42 @@ type mtpKcpConn struct {
 	rdl   time.Time
 	once  sync.Once
 	clost chan struct{}
+	log   *slog.Logger // 可空：队列满丢段告警出口
+
+	// dropped 入向队列满累计丢段数（数据与 ACK 一并计入）；
+	// lastDropLog 上次告警的 wall-clock 毫秒（限频去抖）。
+	dropped     atomic.Int64
+	lastDropLog atomic.Int64
 }
 
-func newMtpKcpConn(eg *kcpEgress) *mtpKcpConn {
-	return &mtpKcpConn{eg: eg, ch: make(chan kcpFeedItem, 4096), clost: make(chan struct{})}
+func newMtpKcpConn(eg *kcpEgress, log *slog.Logger) *mtpKcpConn {
+	return &mtpKcpConn{eg: eg, ch: make(chan kcpFeedItem, 4096),
+		clost: make(chan struct{}), log: log}
 }
 
+// kcpDropGlobal 进程级累计丢段数（观测出口，供 /metrics 后续接用）。
+var kcpDropGlobal atomic.Int64
+
+// KcpDropTotal 返回本进程所有 KCP 入向队列的累计丢段数。
+func KcpDropTotal() int64 { return kcpDropGlobal.Load() }
+
+// feed 投递一个入向段；队列满（4096 深度，远超媒体突发——持续打满
+// 说明重组端停摆）时丢弃并计数，附限频告警（30s 一条，防洪流期日志
+// 风暴）。丢段数据与 ACK 一并计入：观测到增长即链路单侧吞吐异常。
 func (c *mtpKcpConn) feed(data []byte, addr net.Addr) {
 	cp := append([]byte(nil), data...)
 	select {
 	case c.ch <- kcpFeedItem{data: cp, addr: addr}:
 	default:
+		n := c.dropped.Add(1)
+		kcpDropGlobal.Add(1)
+		now := time.Now().UnixMilli()
+		last := c.lastDropLog.Load()
+		if now-last >= 30000 && c.lastDropLog.CompareAndSwap(last, now) &&
+			c.log != nil {
+			c.log.Warn("kcp 入向队列满，丢段（数据与 ACK 一并丢弃）",
+				"dropped_total", n)
+		}
 	}
 }
 
@@ -260,8 +285,8 @@ func startKcpPair(tr Transport, dev *net.UDPAddr, linkID, devID, uid uint32,
 	eg.addDest(kcpDest{addr: dev, relay: true, route: uint64(devID), tag: "nat-rly-dev"})
 	eg.addDest(kcpDest{addr: dev, relay: true, route: uint64(uid), tag: "nat-rly-uid"})
 
-	ctlAd := newMtpKcpConn(eg)
-	fileAd := newMtpKcpConn(eg)
+	ctlAd := newMtpKcpConn(eg, log)
+	fileAd := newMtpKcpConn(eg, log)
 	demux := newKcpDemux()
 	ctlConv := linkID | 0x80000000
 	fileConv := linkID & 0x7fffffff

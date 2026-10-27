@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -452,8 +453,8 @@ func TestAcceptDanceOrder(t *testing.T) {
 // TestKcpDemuxRoutesByConv：两个 conv 的假段喂分流器，各到各会话队列。
 func TestKcpDemuxRoutesByConv(t *testing.T) {
 	eg := newKcpEgress(nilTransport{})
-	ctlAd := newMtpKcpConn(eg)
-	fileAd := newMtpKcpConn(eg)
+	ctlAd := newMtpKcpConn(eg, nil)
+	fileAd := newMtpKcpConn(eg, nil)
 	d := newKcpDemux()
 	const ctlConv, fileConv = 0x80030001, 0x00030001
 	d.addFlow(ctlConv, ctlAd)
@@ -672,6 +673,56 @@ func TestCallerMeterGateAndTeardown(t *testing.T) {
 	}
 }
 
+// TestStopClosesOnce：挂断 CLOSE(cmd=4) 仅单发一次（对齐官方客户端
+// 挂断形态）。CLOSE 经 KCP ctl 会话写出，每个目的地各投一份同一 KCP 段，
+// 故以「含 CLOSE TLV 的不同 KCP 段号(sn)个数」计数发送批次：单发 → 恰
+// 1 个 sn；旧 ×3 形态会产出 3 个递增 sn。
+func TestStopClosesOnce(t *testing.T) {
+	tr := &fakeTransport{}
+	c := New(10000001, 3221225473, 387648820, Options{
+		Transport: tr, Creds: CloudCreds{C1: 1, C2: 2, S1: 3, S2: 4},
+		Log: quietLog(), MeterTickEvery: 10 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	linkID, sid := c.IDs()
+	from, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:55555")
+	// 设备 meter_req ×7 + 设备 ack ×6 → 单侧门控开门（transfer/ctl）。
+	for i := 1; i <= 7; i++ {
+		c.Tap()(deviceMeterReq(linkID, 10000001, 3221225473, uint32(i)), from)
+	}
+	ack := deviceMeterReq(linkID, 10000001, 3221225473, 1)
+	ack[5] = 2
+	Put32(ack, 0x0C, 0)
+	for i := 0; i < 6; i++ {
+		c.Tap()(ack, from)
+	}
+	time.Sleep(300 * time.Millisecond) // 等 KCP 对建立、ctl 循环起步
+
+	c.Stop()
+	time.Sleep(150 * time.Millisecond) // KCP 段经 update 节拍刷出的余量
+	if c.State() != StateClosed {
+		t.Fatalf("state after Stop = %s", c.State())
+	}
+	want := BuildAvStreamCtl(sid, CmdClose, nil, 0, 0) // cmd=4 不携带 token
+	sns := map[uint32]bool{}
+	tr.mu.Lock()
+	for _, pkt := range tr.sent {
+		off := bytes.Index(pkt, want)
+		if off < 12 { // TLV 前 = KCP 段头 24B（sn@段头+12 = TLV-12）
+			continue
+		}
+		sns[binary.LittleEndian.Uint32(pkt[off-12:off-8])] = true
+	}
+	tr.mu.Unlock()
+	if len(sns) != 1 {
+		t.Fatalf("CLOSE 发送批次 = %d 个 KCP 段（sn 集合 %v），应为 1（单发）", len(sns), sns)
+	}
+}
+
 // TestRandCallID：非零、独立。
 func TestRandCallID(t *testing.T) {
 	if RandCallID() == 0 {
@@ -679,5 +730,75 @@ func TestRandCallID(t *testing.T) {
 	}
 	if RandCallID() == RandCallID() {
 		t.Fatal("consecutive draws identical")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 建链看门狗（link watchdog）
+// ---------------------------------------------------------------------------
+
+// TestCallerLinkWatchdogTimeout：完全静默（无 meter 交互、无 TLV3）时，
+// 短窗看门狗必须主动完整拆链——closed 且携带超时错误（否则会话永停
+// calling、槽位卡死，媒体源无从退避重拨）。
+func TestCallerLinkWatchdogTimeout(t *testing.T) {
+	tr := &fakeTransport{}
+	c := New(10000001, 3221225473, 387648820, Options{
+		Transport: tr, Creds: CloudCreds{C1: 1, C2: 2, S1: 3, S2: 4},
+		Log: quietLog(), MeterTickEvery: 10 * time.Millisecond,
+		LinkWatchdog: 150 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitForState(t, c, StateClosed, 3*time.Second)
+	err := c.Err()
+	if err == nil || !strings.Contains(err.Error(), "建链超时") {
+		t.Fatalf("看门狗拆链错误应为建链超时: %v", err)
+	}
+	// 拆链后 tap 不再吞包
+	from, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:55555")
+	linkID, _ := c.IDs()
+	if c.Tap()(deviceMeterReq(linkID, 10000001, 3221225473, 1), from) {
+		t.Fatal("closed caller 的 tap 不得再消费 meter 包")
+	}
+}
+
+// TestCallerLinkWatchdogDisarmedOnStart：正常建链（START 到达）后看门狗
+// 必须撤防——短窗内完成建链的呼叫不得被超时误杀。
+func TestCallerLinkWatchdogDisarmedOnStart(t *testing.T) {
+	tr := &fakeTransport{}
+	c := New(10000001, 3221225473, 387648820, Options{
+		Transport: tr, Creds: CloudCreds{C1: 1, C2: 2, S1: 3, S2: 4},
+		Log: quietLog(), MeterTickEvery: 10 * time.Millisecond,
+		LinkWatchdog: 250 * time.Millisecond,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	linkID, sid := c.IDs()
+	from, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:55555")
+	// 快速建链：meter 门开 → ACCEPT → START（真机形态亚秒级完成）
+	for i := 1; i <= 7; i++ {
+		c.Tap()(deviceMeterReq(linkID, 10000001, 3221225473, uint32(i)), from)
+	}
+	ack := deviceMeterReq(linkID, 10000001, 3221225473, 1)
+	ack[5] = 2
+	Put32(ack, 0x0C, 0)
+	for i := 0; i < 6; i++ {
+		c.Tap()(ack, from)
+	}
+	waitForState(t, c, StateCtl, 3*time.Second)
+	feedTlv3(c, CmdAccept, sid)
+	feedTlv3(c, CmdStart, sid)
+	waitForState(t, c, StateStreaming, 3*time.Second)
+
+	// 越过看门狗窗口仍须存活（START 已撤防，不得误杀正常会话）
+	time.Sleep(400 * time.Millisecond)
+	if c.State() == StateClosed {
+		t.Fatalf("建链成功后遭看门狗误杀: err=%v", c.Err())
 	}
 }

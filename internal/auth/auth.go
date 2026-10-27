@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +123,8 @@ type Token struct {
 }
 
 // CreateToken mints a token; the secret is shown once.
+// 铸造的是长期 API 令牌（HA 等持久集成使用，无 TTL）。网页登录的
+// 会话令牌请用 CreateSessionToken。
 func (s *Service) CreateToken(name string, scopes []string) (*Token, error) {
 	for _, sc := range scopes {
 		switch sc {
@@ -140,6 +143,36 @@ func (s *Service) CreateToken(name string, scopes []string) (*Token, error) {
 	return &Token{ID: id, Name: name, Scopes: scopes, Secret: secret}, nil
 }
 
+// tokenExpKVPrefix 会话令牌有效期的 KV 键前缀（值为到期 Unix 秒）；
+// 长期 API 令牌没有对应记录。
+const tokenExpKVPrefix = "token_expires_"
+
+// defaultSessionTTL 会话令牌默认有效期（24h）。
+const defaultSessionTTL = 24 * time.Hour
+
+// CreateSessionToken 铸造带 TTL 的网页登录会话令牌（admin 权限）。
+// 有效期持久化在 KV 表（进程重启不丢失）；到期后在 CheckToken 校验时
+// 惰性淘汰（过期即从令牌表删除），修复旧实现"每次登录铸造永久 admin
+// 令牌、无 TTL 无清理、无限累积"的问题。
+func (s *Service) CreateSessionToken(ttl time.Duration) (*Token, error) {
+	if ttl <= 0 {
+		ttl = defaultSessionTTL
+	}
+	tok, err := s.CreateToken("web-session", []string{ScopeAdmin})
+	if err != nil {
+		return nil, err
+	}
+	exp := time.Now().Add(ttl).Unix()
+	if err := s.store.KVSet(tokenExpKVPrefix+tok.ID, strconv.FormatInt(exp, 10)); err != nil {
+		// 有效期写不进去就不能放行：回滚刚铸造的令牌，避免产生一枚
+		// 无 TTL 的永久会话令牌。
+		_ = s.DeleteToken(tok.ID)
+		return nil, err
+	}
+	s.log.Info("session token minted", "id", tok.ID, "ttl", ttl.String())
+	return tok, nil
+}
+
 // ListTokens lists tokens without secrets.
 func (s *Service) ListTokens() ([]map[string]any, error) { return s.store.ListTokens() }
 
@@ -152,13 +185,33 @@ func hashSecret(s string) string {
 }
 
 // CheckToken validates "Bearer <secret>" and returns its scopes.
+// 带 TTL 的会话令牌到期即吊销（惰性淘汰：此刻从令牌表删除，后续
+// 校验与列表自然不再可见）。
 func (s *Service) CheckToken(secret string) (scopes []string, ok bool) {
 	id, sc, ok := s.store.LookupToken(hashSecret(secret))
 	if !ok {
 		return nil, false
 	}
-	_ = id
+	if s.sessionTokenExpired(id) {
+		return nil, false
+	}
 	return strings.Split(sc, ","), true
+}
+
+// sessionTokenExpired 判断会话令牌是否到期并执行惰性淘汰；无 KV 记录
+// 的令牌是长期 API 令牌，永不过期。
+func (s *Service) sessionTokenExpired(id string) bool {
+	v, err := s.store.KVGet(tokenExpKVPrefix + id)
+	if err != nil || v == "" {
+		return false
+	}
+	exp, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || time.Now().Unix() < exp {
+		return false
+	}
+	_ = s.DeleteToken(id)
+	s.log.Info("session token expired, revoked", "id", id)
+	return true
 }
 
 // --- HTTP middleware ---

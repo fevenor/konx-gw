@@ -65,6 +65,11 @@ func (m *Manager) SetSinkFactory(fn func(deviceID string) Sink) {
 }
 
 // Start begins an intercom session; exclusive per device.
+//
+// 会话生命周期独立于触发它的请求（M5）：即使调用方传入的 ctx 是 HTTP
+// 请求作用域（响应返回即取消），会话也派生自 context.Background——
+// REST 触发的对讲不能随 HTTP 响应消亡。回收路径只有两条：显式 Stop，
+// 或心跳看门狗 5s 无 Write/Ping 超时自动关。
 func (m *Manager) Start(ctx context.Context, deviceID, by string) (*Session, error) {
 	m.mu.Lock()
 	sinkFn := m.sinkFn
@@ -73,7 +78,9 @@ func (m *Manager) Start(ctx context.Context, deviceID, by string) (*Session, err
 		return nil, errors.New("talk session busy on this device")
 	}
 	sink := sinkFn(deviceID)
-	sctx, cancel := context.WithCancel(ctx)
+	// 注意：这里不绑定调用方 ctx（见函数注释），调用方若需提前终止，
+	// 应显式调用 Stop。
+	sctx, cancel := context.WithCancel(context.Background())
 	s := &Session{DeviceID: deviceID, Started: time.Now(), By: by, codec: "PCMA", sink: sink, cancel: cancel, last: time.Now()}
 	m.sessions[deviceID] = s
 	m.mu.Unlock()

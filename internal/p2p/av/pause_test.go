@@ -258,3 +258,62 @@ func TestCallerResumeNoopAndClosedSafety(t *testing.T) {
 		t.Fatalf("closed 后 Pause/Resume 不得改变状态: %s", c.State())
 	}
 }
+
+// TestCallerPauseDiscardsAnnexHalfPacket：暂停边界必须丢弃 annex 跨期
+// 半包——暂停前滞留缓冲的未完成 NAL 若带入恢复期，会与首帧新数据拼合
+// 成坏帧（Resume 后首帧花屏）。Pause 即清缓冲；Resume 后首帧从干净
+// NAL 边界开始。
+func TestCallerPauseDiscardsAnnexHalfPacket(t *testing.T) {
+	tr := &fakeTransport{}
+	c := newHeldCaller(t, tr)
+	_, sid := c.IDs()
+
+	// 推到 streaming
+	feedTlv3(c, CmdAccept, sid)
+	feedTlv3(c, CmdStart, sid)
+	waitForState(t, c, StateStreaming, 3*time.Second)
+
+	var mu sync.Mutex
+	var got [][]byte
+	c.OnH264(func(nal []byte) {
+		mu.Lock()
+		got = append(got, append([]byte(nil), nal...))
+		mu.Unlock()
+	})
+
+	// 预置跨期半包：喂一个无后续起始码的 NAL → 滞留 annex 缓冲
+	feedTlv4Nal(c, mkNal("HALF"), 1)
+	c.mu.Lock()
+	n := len(c.annex.buf)
+	c.mu.Unlock()
+	if n == 0 {
+		t.Fatal("预置失败：半包未滞留 annex 缓冲")
+	}
+
+	// 挂起进入边界：半包必须被丢弃
+	c.Pause()
+	c.mu.Lock()
+	n = len(c.annex.buf)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("Pause 后 annex 残留 %d 字节（跨期半包未丢弃）", n)
+	}
+
+	// 恢复后首帧必须干净：不含旧半包拼合
+	c.Resume()
+	feedTlv4Nal(c, mkNal("FULL"), 2)
+	feedTlv4Nal(c, mkNal("EDGE"), 3) // 边界驱动：冲出 FULL
+	waitForCond(t, 2*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(got) == 1
+	}, "恢复后未产出首个完整 NAL")
+	mu.Lock()
+	defer mu.Unlock()
+	if bytes.Contains(got[0], []byte("HALF")) {
+		t.Fatal("旧半包拼入恢复后首帧（花屏根因未修复）")
+	}
+	if !bytes.Contains(got[0], []byte("FULL")) {
+		t.Fatalf("恢复后首 NAL 应为 FULL: % x", got[0])
+	}
+}

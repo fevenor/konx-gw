@@ -9,6 +9,14 @@ announce:
       example: "<设备ID>"
       selector:
         text:
+    gateway:
+      name: 网关
+      description: >
+        多网关部署时指定目标网关（HA 配置项 entry ID 或主机地址）。
+        缺省按设备自动匹配所属网关；匹配不到时使用第一个配置的网关。
+      required: false
+      selector:
+        text:
     text:
       name: 文本
       description: 将由 HA TTS 转语音后发送（须自行先转 PCM16 8k 时可用 url）

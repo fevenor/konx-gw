@@ -47,6 +47,17 @@ const (
 	fuIndicator = 28   // FU-A NAL 类型
 )
 
+const (
+	// 熔断参数：连续建链失败达阈值进入长冷却——持续 REJECT/节流下
+	// 每 60s 一次完整呼叫会持续消耗服务器节流窗信誉；冷却可被新观众
+	// Acquire（manager 对既有槽位仍调 Start）提前唤醒一次尝试。
+	p2pFailStreakLimit = 5
+	p2pCooldown        = 10 * time.Minute
+	// 呼叫存活超过该时长视为建链成功过（失败路径均在秒级返回——
+	// REJECT/看门狗/建链超时；成功呼叫分钟级存活），失败计数清零。
+	p2pSuccessUptime = 60 * time.Second
+)
+
 // p2pSource 驱动一路 AV 呼叫并打包 H264。首次收到 SPS+PPS 后合成
 // description.Session（format.H264，sprop 由 SPS/PPS 字段派生）并转 Active。
 type p2pSource struct {
@@ -58,9 +69,26 @@ type p2pSource struct {
 	mu      sync.Mutex
 	sink    func(*description.Media, *rtp.Packet)
 	stateCh chan SourceState
-	cancel  context.CancelFunc
-	done    chan struct{}
-	running atomic.Bool // 重拨循环存活标记：Start 幂等（暂停/退避中不重复起）
+	// emitMu 专用于 emit 与 stateCh 关闭的互斥（独立于 mu：onNAL 持
+	// mu 调 emit，emit 再拿 mu 会自锁——Mutex 不可重入）。stateChClosed
+	//（emitMu 保护）置位后 emit 不再发送，防 send on closed panic。
+	emitMu        sync.Mutex
+	stateChClosed bool
+	cancel        context.CancelFunc
+	done          chan struct{}
+	running       atomic.Bool // 重拨循环存活标记：Start 幂等（暂停/退避中不重复起）
+
+	// 连续失败熔断（mu 保护）：failStreak 连续建链失败计数；cooling
+	// 置位期间退避等待改用长冷却。wake 供冷却期被新观众显式需求
+	//（Start 幂等分支）提前唤醒一次尝试。节奏参数在 newP2PSource
+	// 填默认常量，测试可注入缩短周期。
+	failStreak int
+	cooling    bool
+	wake       chan struct{}
+	failLimit  int
+	cooldown   time.Duration
+	successMin time.Duration
+	firstRetry time.Duration
 
 	desc   *description.Session
 	media  *description.Media
@@ -88,6 +116,11 @@ func newP2PSource(devID uint32, treatedPwd int, dial P2PDialer, log *slog.Logger
 		stateCh:    make(chan SourceState, 16),
 		done:       make(chan struct{}),
 		closed:     make(chan struct{}),
+		wake:       make(chan struct{}, 1),
+		failLimit:  p2pFailStreakLimit,
+		cooldown:   p2pCooldown,
+		successMin: p2pSuccessUptime,
+		firstRetry: 3 * time.Second,
 		pkt: h264RTPState{
 			seq:  uint16(rand.Uint32()),
 			ts:   rand.Uint32(),
@@ -111,6 +144,14 @@ func (s *p2pSource) SetSink(fn func(*description.Media, *rtp.Packet)) {
 }
 
 func (s *p2pSource) emit(st State, err error) {
+	// Stop 收尾关闭 stateCh 后不再发送（守卫防 send on closed panic；
+	// 终态 StateStopped 已在 close 前发出，缓冲通道保序不丢）。
+	// 持 mu 的调用方（onNAL）可安全调用：emit 用独立 emitMu。
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.stateChClosed {
+		return
+	}
 	select {
 	case s.stateCh <- SourceState{State: st, Err: err}:
 	default:
@@ -122,8 +163,22 @@ func (s *p2pSource) emit(st State, err error) {
 // 暂停中的源由 Resume 复活，重拨中的源由自身循环收敛。
 func (s *p2pSource) Start() {
 	if !s.running.CompareAndSwap(false, true) {
+		s.mu.Lock()
+		cooling := s.cooling
+		s.mu.Unlock()
+		if cooling {
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+		}
 		return
 	}
+	// 新周期：清零上一周期的失败熔断状态（Stop 后复用本对象重启）。
+	s.mu.Lock()
+	s.failStreak = 0
+	s.cooling = false
+	s.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.cancel = cancel
@@ -132,28 +187,75 @@ func (s *p2pSource) Start() {
 		defer s.running.Store(false)
 		defer close(s.done)
 		s.emit(StateStarting, nil)
-		backoff := 3 * time.Second
+		backoff := s.firstRetry
 		for {
 			if ctx.Err() != nil {
 				return
 			}
+			startedAt := time.Now()
 			err := s.runOnce(ctx)
 			if ctx.Err() != nil {
 				return
 			}
+			// 存活够久 = 建链成功过：失败计数与熔断态清零、退避复位
+			//（失败路径都在秒级返回——REJECT/看门狗/建链超时，不会
+			// 误判成功）。
+			if time.Since(startedAt) >= s.successMin {
+				s.mu.Lock()
+				s.failStreak = 0
+				s.cooling = false
+				s.mu.Unlock()
+				backoff = s.firstRetry
+			}
+			s.noteFailure()
 			s.emit(StateError, err)
 			s.log.Warn("p2p source ended, retrying", "dev", s.devID, "err", err)
+			s.mu.Lock()
+			cooling := s.cooling
+			s.mu.Unlock()
+			wait := backoff
+			if cooling {
+				wait = s.cooldown // 熔断冷却替换常规退避
+			}
 			select {
-			case <-time.After(backoff):
+			case <-time.After(wait):
+			case <-s.wake:
+				// 冷却被新观众显式需求提前唤醒：立即做一次尝试；
+				// 失败计数保留（再失败仍处熔断态，继续长冷却）。
+				s.mu.Lock()
+				streak := s.failStreak
+				s.cooling = false
+				s.mu.Unlock()
+				s.log.Info("p2p 熔断冷却被新观众需求提前唤醒", "dev", s.devID,
+					"fail_streak", streak)
 			case <-ctx.Done():
 				return
 			}
-			backoff *= 2
-			if backoff > 60*time.Second {
-				backoff = 60 * time.Second
+			if cooling {
+				backoff = s.firstRetry // 长冷却已付出代价，退避从头计
+			} else {
+				backoff *= 2
+				if backoff > 60*time.Second {
+					backoff = 60 * time.Second
+				}
 			}
 		}
 	}()
+}
+
+// noteFailure 记一次建链失败；连续达阈值（含 dial 失败、REJECT、看门狗
+// 拆链等全部失败路径）进入熔断冷却态——无限重拨在持续节流下只会烧
+// 服务器节流窗信誉，长冷却给其自然恢复留时间。
+func (s *p2pSource) noteFailure() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failStreak++
+	if s.failStreak >= s.failLimit && !s.cooling {
+		s.cooling = true
+		s.log.Warn("p2p 连续建链失败达到阈值，进入熔断长冷却",
+			"dev", s.devID, "fail_streak", s.failStreak,
+			"limit", s.failLimit, "cooldown", s.cooldown.String())
+	}
 }
 
 // runOnce 建立一路呼叫并泵到其终结。返回错误触发重拨。
@@ -163,12 +265,10 @@ func (s *p2pSource) runOnce(ctx context.Context) error {
 		return fmt.Errorf("dial: %w", err)
 	}
 	ended := make(chan error, 1)
-	s.mu.Lock()
-	s.call = call
-	s.resetMediaLocked() // 新呼叫：清 SPS/PPS/描述，重新合成
-	sink := s.sink
-	s.mu.Unlock()
-	call.OnH264(func(nal []byte) { s.onNAL(nal, sink) })
+	// 先注册 closed 回调、再补查当前状态：dial 返回到注册之间存在
+	// 竞态窗口（呼叫极快失败即已 closed，事件回调错过），仅靠回调
+	// 会漏事件导致本函数永久挂起。补查兜底：closed 必达（ended 带
+	// 缓冲 1，两路径同时命中不阻塞）。
 	call.OnState(func(st av.State, err error) {
 		if st == av.StateClosed {
 			select {
@@ -177,9 +277,18 @@ func (s *p2pSource) runOnce(ctx context.Context) error {
 			}
 		}
 	})
+	if call.State() == av.StateClosed {
+		return fmt.Errorf("call closed before pump start")
+	}
+	s.mu.Lock()
+	s.call = call
+	s.resetMediaLocked() // 新呼叫：清 SPS/PPS/描述，重新合成
+	sink := s.sink
+	s.mu.Unlock()
+	call.OnH264(func(nal []byte) { s.onNAL(nal, sink) })
 	select {
 	case <-ctx.Done():
-		call.Stop() // 完整挂断（CLOSE×3+拆链，v1 语义）
+		call.Stop() // 完整挂断（CLOSE 单发+拆链，v1 语义）
 		return ctx.Err()
 	case err := <-ended:
 		return err
@@ -194,7 +303,9 @@ func (s *p2pSource) resetMediaLocked() {
 }
 
 // Stop 停止源：取消重拨循环并完整挂断当前呼叫（session_hold 暂停中的
-// 呼叫也走本方法彻底拆除——shutdown 路径）。
+// 呼叫也走本方法彻底拆除——shutdown 路径）。收尾：先广播终态
+// StateStopped 再关闭状态通道（缓冲通道保序，消费者 range 到 close
+// 自然退出）；emit 以 stateChClosed 守卫，close 后不再发送防 panic。
 func (s *p2pSource) Stop() {
 	s.mu.Lock()
 	cancel := s.cancel
@@ -207,7 +318,13 @@ func (s *p2pSource) Stop() {
 		call.Stop()
 	}
 	<-s.done
+	// 终态先发再关通道（缓冲保序，消费者 range 到 close 自然退出）；
+	// 关闭与 emit 以 emitMu 互斥，close 后 emit 守卫不再发送。
 	s.emit(StateStopped, nil)
+	s.emitMu.Lock()
+	s.stateChClosed = true
+	close(s.stateCh)
+	s.emitMu.Unlock()
 }
 
 // Pause 暂停取流但保持呼叫链路（session_hold，Manager 空闲路径调用）：

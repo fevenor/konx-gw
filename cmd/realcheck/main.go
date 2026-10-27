@@ -43,10 +43,11 @@ func main() {
 		return
 	}
 	defer c.Close()
-	req := `POST /onvif/device_service HTTP/1.1\r\nHost: 192.168.1.100:5000\r\nContent-Type: application/soap+xml\r\nContent-Length: %d\r\n\r\n%s`
 	body := `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetDeviceInformation xmlns="http://www.onvif.org/ver10/device/wsdl"/></s:Body></s:Envelope>`
 	c.SetDeadline(time.Now().Add(4 * time.Second))
-	fmt.Fprintf(c, req, len(body), body)
+	// 注意：请求模板必须用解释字符串（双引号），\r\n 才是真实 CRLF；
+	// 反引号原始字符串会把 \r\n 变成字面量四个字符，导致请求行/头全部畸形。
+	fmt.Fprint(c, onvifProbeRequest(body))
 	buf := make([]byte, 4096)
 	n, _ := c.Read(buf)
 	resp := string(buf[:n])
@@ -55,6 +56,12 @@ func main() {
 	} else {
 		fmt.Println("DEVICE ONVIF resp head:", firstN(resp, 120))
 	}
+}
+
+// onvifProbeRequest 构造完整的 ONVIF GetDeviceInformation 探测请求。
+// 模板使用双引号解释字符串，保证 \r\n 为真实 CRLF（D13 修复点，有测试守护）。
+func onvifProbeRequest(body string) string {
+	return fmt.Sprintf("POST /onvif/device_service HTTP/1.1\r\nHost: 192.168.1.100:5000\r\nContent-Type: application/soap+xml\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
 }
 
 func contains(s, sub string) bool { return len(s) >= len(sub) && indexOf(s, sub) >= 0 }

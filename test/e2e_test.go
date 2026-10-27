@@ -388,8 +388,10 @@ func TestONVIFSurface(t *testing.T) {
 		t.Fatalf("GetProfiles missing tokens: %.300s", body)
 	}
 
-	// GetStreamUri points at the egress
-	_, body = post("/onvif/media_service", `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetStreamUri xmlns="http://www.onvif.org/ver10/media/wsdl"><ProfileToken>profile_" + e2eDeviceID + "_main</ProfileToken></GetStreamUri></s:Body></s:Envelope>`)
+	// GetStreamUri points at the egress（元素式 ProfileToken：此前反引号
+	// 字符串里误写 `+" + e2eDeviceID + "+` 字面量，发送的是垃圾 token、
+	// 恰好掩盖了元素式解析缺失）
+	_, body = post("/onvif/media_service", `<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><GetStreamUri xmlns="http://www.onvif.org/ver10/media/wsdl"><ProfileToken>profile_`+e2eDeviceID+`_main</ProfileToken></GetStreamUri></s:Body></s:Envelope>`)
 	if !strings.Contains(body, "rtsp://127.0.0.1:") || !strings.Contains(body, "/konx/"+e2eDeviceID+"/main") {
 		t.Fatalf("GetStreamUri: %.300s", body)
 	}

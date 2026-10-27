@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -163,6 +164,20 @@ func (f *FFmpeg) MJPEGHandler(w io.Writer, src string, stop <-chan struct{}) err
 	case <-stop:
 		_ = cmd.Process.Kill()
 		<-done
+		// Kill 后必须 Wait 回收子进程，否则僵尸残留（进程表/fd 泄漏）；
+		// Wait 加时限保护——进程已 Kill 仅缺 reap，卡死超限则放弃并
+		// 告警（不影响返回语义）。
+		waited := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(waited)
+		}()
+		select {
+		case <-waited:
+		case <-time.After(5 * time.Second):
+			slog.Warn("ffmpeg MJPEG 进程 Wait 超时，放弃回收（进程已 Kill）",
+				"path", f.ffpath())
+		}
 		return nil
 	case err := <-done:
 		_ = cmd.Wait()

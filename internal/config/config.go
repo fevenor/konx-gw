@@ -99,6 +99,15 @@ type App struct {
 	Web struct {
 		Listen  string `yaml:"listen"`
 		DataDir string `yaml:"data_dir"`
+		// MetricsAuth 控制 /metrics 是否要求与 API 同源的 Bearer 令牌
+		// 鉴权。默认（未配置/nil）开启；仅可信内网的 Prometheus 抓取
+		// 场景可显式置 false 关闭——关闭后指标（含设备/客户端规模）
+		// 将对未鉴权方暴露。
+		MetricsAuth *bool `yaml:"metrics_auth"`
+		// SessionTTL 网页登录会话令牌的有效期（默认 24h）。仅作用于
+		// /api/login 铸造的会话令牌（到期惰性吊销）；HA 等集成的长期
+		// API 令牌不受影响。
+		SessionTTL time.Duration `yaml:"session_ttl"`
 	} `yaml:"web"`
 	Events struct {
 		RetentionDays int  `yaml:"retention_days"`
@@ -143,6 +152,7 @@ func Defaults() *App {
 	c.ONVIF.Topics = []string{"tns1:Doorbell/Stimulus"}
 	c.Web.Listen = ":8080"
 	c.Web.DataDir = "/data"
+	c.Web.SessionTTL = 24 * time.Hour // MetricsAuth 缺省 nil = 鉴权开启
 	c.Events.RetentionDays = 90
 	c.Events.MaxRows = 100000
 	c.Events.KeepRaw = true
@@ -209,6 +219,16 @@ func (c *App) applyEnv() {
 	}
 	if v := os.Getenv("KONX_WEB_LISTEN"); v != "" {
 		c.Web.Listen = v
+	}
+	if v := os.Getenv("KONX_WEB_METRICS_AUTH"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Web.MetricsAuth = &b
+		}
+	}
+	if v := os.Getenv("KONX_WEB_SESSION_TTL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			c.Web.SessionTTL = d
+		}
 	}
 	if v := os.Getenv("KONX_DATA_DIR"); v != "" {
 		c.Web.DataDir = v
@@ -287,12 +307,14 @@ func (c *App) Validate() error {
 			}
 		}
 	}
-	for _, d := range c.Devices {
-		if d.ID == "" {
+	// 注意按索引写回：`for _, d := range` 的 d 是副本，往副本上写
+	// d.RTSP.Pass 永远不会落回 c.Devices，"auto" 缺省将不生效。
+	for i := range c.Devices {
+		if c.Devices[i].ID == "" {
 			return fmt.Errorf("device entry missing id")
 		}
-		if d.RTSP.Pass == "" {
-			d.RTSP.Pass = "auto"
+		if c.Devices[i].RTSP.Pass == "" {
+			c.Devices[i].RTSP.Pass = "auto"
 		}
 	}
 	return nil

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
@@ -81,6 +82,12 @@ type rtspSource struct {
 	stateCh chan SourceState
 	cancel  context.CancelFunc
 	done    chan struct{}
+	running atomic.Bool // 拉流循环存活标记：Start 幂等（退避/连接中不重复起）
+
+	// emitMu 串行化 emit 与 Stop 的通道收尾：close 后不再发送（防
+	// send-on-closed-channel panic），缓冲保序（终态先入队再关闭）。
+	emitMu        sync.Mutex
+	stateChClosed bool
 
 	desc *description.Session
 }
@@ -110,19 +117,30 @@ func (s *rtspSource) SetSink(fn func(*description.Media, *rtp.Packet)) {
 }
 
 func (s *rtspSource) emit(st State, err error) {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	if s.stateChClosed {
+		return
+	}
 	select {
 	case s.stateCh <- SourceState{State: st, Err: err}:
 	default:
 	}
 }
 
-// Start launches the pull loop in the background.
+// Start launches the pull loop in the background. 幂等：循环已在跑
+// （连接中/退避重连中）时二次 Start 直接返回，不再叠加第二个循环与
+// 状态风暴；ctx 挂到 s.cancel 供 Stop 取消（不会被并发的 Start 覆盖）。
 func (s *rtspSource) Start() {
+	if !s.running.CompareAndSwap(false, true) {
+		return
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.cancel = cancel
 	s.mu.Unlock()
 	go func() {
+		defer s.running.Store(false)
 		defer close(s.done)
 		s.emit(StateStarting, nil)
 		backoff := time.Second
@@ -149,7 +167,9 @@ func (s *rtspSource) Start() {
 	}()
 }
 
-// Stop cancels the loop and waits.
+// Stop cancels the loop and waits. 终态 StateStopped 先入通道（缓冲保
+// 序）再关闭通道——监听方 for-range 正常退出不再泄漏；幂等（重复 Stop
+// 不二次 close）。
 func (s *rtspSource) Stop() {
 	s.mu.Lock()
 	cancel := s.cancel
@@ -159,6 +179,12 @@ func (s *rtspSource) Stop() {
 	}
 	<-s.done
 	s.emit(StateStopped, nil)
+	s.emitMu.Lock()
+	if !s.stateChClosed {
+		s.stateChClosed = true
+		close(s.stateCh)
+	}
+	s.emitMu.Unlock()
 }
 
 // States 返回状态通道（source 契约）。
@@ -260,7 +286,17 @@ type Manager struct {
 
 	mu    sync.Mutex
 	slots map[string]*slot // key device|profile
-	sub   func(SourceState)
+
+	// 状态订阅（多订阅：app 接线 API 广播与 rtspout OnSourceState 等）。
+	// subsMu 仅保护 subs 切片本身；回调在锁外遍历调用（回调可能反向
+	// 进入 Manager/Desc 等，持锁调用会自锁）。
+	subsMu sync.Mutex
+	subs   []func(SourceState)
+
+	// 槽位 egress writer 注册表（实例化：多 Manager 实例互不串味，
+	// 测试可并行）。
+	wmu     sync.Mutex
+	writers map[string]func(*description.Media, *rtp.Packet)
 
 	ffmpeg string
 
@@ -271,7 +307,11 @@ type Manager struct {
 }
 
 func NewManager(cfg *config.App, log *slog.Logger, eng *events.Engine) *Manager {
-	m := &Manager{cfg: cfg, log: log, eng: eng, slots: map[string]*slot{}}
+	m := &Manager{
+		cfg: cfg, log: log, eng: eng,
+		slots:   map[string]*slot{},
+		writers: map[string]func(*description.Media, *rtp.Packet){},
+	}
 	return m
 }
 
@@ -281,12 +321,22 @@ func (m *Manager) SetP2PDialer(d P2PDialer) { m.p2pDial = d }
 // SetP2PPwdResolver 安装 treated 密码解析器。
 func (m *Manager) SetP2PPwdResolver(r P2PPwdResolver) { m.p2pPwd = r }
 
-// OnState registers the transition listener.
-func (m *Manager) OnState(fn func(SourceState)) { m.sub = fn }
+// OnState 追加一个状态变迁订阅（多订阅，按注册序遍历调用）。
+func (m *Manager) OnState(fn func(SourceState)) {
+	m.subsMu.Lock()
+	m.subs = append(m.subs, fn)
+	m.subsMu.Unlock()
+}
 
 func (m *Manager) emit(ss SourceState) {
-	if m.sub != nil {
-		m.sub(ss)
+	m.subsMu.Lock()
+	subs := make([]func(SourceState), len(m.subs))
+	copy(subs, m.subs)
+	m.subsMu.Unlock()
+	// 锁外调用：订阅方（如 rtspout OnSourceState）可能反查 Manager
+	// 的 Desc/Release 等持 m.mu 的方法。
+	for _, fn := range subs {
+		fn(ss)
 	}
 	if m.eng != nil {
 		m.eng.Submit(events.Event{
@@ -342,6 +392,12 @@ func (m *Manager) normProfile(p Profile) Profile {
 	}
 	return p
 }
+
+// NormProfile 导出键规范化（rtspout 出口层统一归一 profile 键用：
+// streams/sessions/RegisterWriter/UnregisterWriter/Desc/Release 必须
+// 与 Acquire 走同一映射，否则写者注册键与查询键错位互踩）。
+// cfg.Media.Source 启动定死，无需加锁。
+func (m *Manager) NormProfile(p Profile) Profile { return m.normProfile(p) }
 
 // Acquire takes a reference, starting the source if needed. The returned
 // release func must be called when the consumer goes away.
@@ -403,23 +459,22 @@ func (m *Manager) Acquire(deviceID string, p Profile) (func(), error) {
 		hold := m.cfg.Media.Source == "p2p-av" && m.cfg.Media.P2P.SessionHold
 		go func() {
 			for st := range sl.src.States() {
-				m.mu.Lock()
+				// 槽位字段统一持 sl.mu 写（锁序 m.mu → sl.mu），
+				// 监听协程不再占 m.mu；refs 同临界区取走供下方
+				// 会话保持死亡拆槽判定（stopSlot 内会再校验）。
+				sl.mu.Lock()
 				sl.state = st.State
 				sl.lastErr = st.Err
 				sl.desc = sl.src.Desc()
 				sl.paused = st.State == StatePaused
-				m.mu.Unlock()
+				refs := sl.refs
+				sl.mu.Unlock()
 				m.emit(SourceState{Device: deviceID, Profile: p, State: st.State, Err: st.Err})
 				// session_hold 保护：保持中的呼叫死亡（REJECT/链路断，
 				// 源进入退避重拨）且无观众——拆掉槽位终止重拨循环，避免
 				// 无人观看时无限重呼烧服务器节流窗；下次观看全新 Acquire。
-				if hold && st.State == StateError {
-					sl.mu.Lock()
-					refs := sl.refs
-					sl.mu.Unlock()
-					if refs == 0 {
-						m.stopSlot(k)
-					}
+				if hold && st.State == StateError && refs == 0 {
+					m.stopSlot(k)
 				}
 			}
 		}()
@@ -441,7 +496,10 @@ func (m *Manager) Acquire(deviceID string, p Profile) (func(), error) {
 		if ps, ok := sl.src.(pausableSource); ok {
 			ps.Resume()
 		}
-	} else if wasIdle && sl.state != StateActive {
+	} else {
+		// Start 幂等（rtspSource running CAS / p2pSource 既有 CAS）：
+		// 已在跑（含退避重连中）直接返回，不再依赖 state 判断——
+		// 消掉锁外读 state 的判断窗口与重复起循环。
 		sl.src.Start()
 	}
 	rel := func() { m.release(k) }
@@ -475,25 +533,33 @@ func (m *Manager) stopSlot(k string) {
 		m.mu.Unlock()
 		return
 	}
+	// C0-2：refs/state/idleTimer 读取并入同一 sl.mu 临界区（锁序
+	// m.mu → sl.mu），消灭「读后放锁、判前被 Acquire」的 TOCTOU 窗口。
 	sl.mu.Lock()
 	if sl.refs != 0 {
+		// 观众回流：放弃本次空闲拆除（清掉已触发的 timer 句柄），
+		// 等下一轮 refs 归零再计时。
 		sl.idleTimer = nil
 		sl.mu.Unlock()
 		m.mu.Unlock()
 		return
 	}
-	sl.mu.Unlock()
 	// session_hold（media.p2p.session_hold，仅 p2p-av）：空闲到期且呼叫
 	// 健康（Active）时不拆链——真机实证服务器对 CLOSE 拆链后的重呼有
 	// 15-30 分钟节流（实测教训），改为暂停保持（KCP/meter 存活，
 	// 同链路重发 cmd=1 即复活）；槽位与已合成描述保留，新观众 Acquire
 	// 走 Resume。非健康态（未就绪/已错）维持既有拆链路径。
-	if ps, ok := sl.src.(pausableSource); ok && m.cfg.Media.P2P.SessionHold && sl.state == StateActive {
-		sl.mu.Lock()
-		sl.idleTimer = nil
-		sl.mu.Unlock()
+	var pauseSrc pausableSource
+	if m.cfg.Media.P2P.SessionHold && sl.state == StateActive {
+		if ps, ok := sl.src.(pausableSource); ok {
+			pauseSrc = ps
+			sl.idleTimer = nil
+		}
+	}
+	sl.mu.Unlock()
+	if pauseSrc != nil {
 		m.mu.Unlock()
-		ps.Pause()
+		pauseSrc.Pause()
 		return
 	}
 	delete(m.slots, k)
@@ -561,22 +627,16 @@ func (m *Manager) Desc(deviceID string, p Profile) *description.Session {
 	return nil
 }
 
-// packet writers registered by the egress server per slot
-var (
-	wmu     sync.Mutex
-	writers = map[string]func(*description.Media, *rtp.Packet){}
-)
-
 func (m *Manager) registerWriter(k string, fn func(*description.Media, *rtp.Packet)) {
-	wmu.Lock()
-	writers[k] = fn
-	wmu.Unlock()
+	m.wmu.Lock()
+	m.writers[k] = fn
+	m.wmu.Unlock()
 }
 
 func (m *Manager) writerFor(k string) func(*description.Media, *rtp.Packet) {
-	wmu.Lock()
-	defer wmu.Unlock()
-	return writers[k]
+	m.wmu.Lock()
+	defer m.wmu.Unlock()
+	return m.writers[k]
 }
 
 // RegisterWriter installs the egress writer for one slot.
@@ -584,13 +644,13 @@ func (m *Manager) RegisterWriter(deviceID string, p Profile, fn func(*descriptio
 	m.registerWriter(deviceID+"|"+string(m.normProfile(p)), fn)
 }
 
-// UnregisterWriter 移除槽位的 egress writer（rtspout dropStream 对称调用，
-// 防止拆链尾包写入已关闭的 ServerStream）。
+// UnregisterWriter 移除槽位的 egress writer（rtspout 拆出口流条目时
+// 对称调用，防止拆链尾包写入已关闭的 ServerStream）。
 func (m *Manager) UnregisterWriter(deviceID string, p Profile) {
 	k := deviceID + "|" + string(m.normProfile(p))
-	wmu.Lock()
-	delete(writers, k)
-	wmu.Unlock()
+	m.wmu.Lock()
+	delete(m.writers, k)
+	m.wmu.Unlock()
 }
 
 // StopAll stops every slot (shutdown).

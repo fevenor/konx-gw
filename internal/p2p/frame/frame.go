@@ -5,6 +5,7 @@ package frame
 import (
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/fevenor/konx-gw/internal/p2p/rc5"
 )
@@ -106,7 +107,11 @@ type Builder struct {
 	C1, C2 uint32
 	S1, S2 uint32
 	S2d    uint32
-	seq    uint32
+	// seq 出向帧序号：同一 Builder 会被多个 goroutine 并发使用
+	//（会话读循环的 MTPRES 应答、呼叫/meter 泵的 CALLING 与对称
+	// FORWARD 应答），必须原子递增——race 实证见 session 集成测试。
+	// 其余字段在 NewBuilder 之后只读，无需保护。
+	seq atomic.Uint32
 }
 
 // NewBuilder prepares a builder and pre-derives sid2.
@@ -114,7 +119,7 @@ func NewBuilder(uid uint64, c1, c2, s1, s2 uint32) *Builder {
 	return &Builder{UID: uid, C1: c1, C2: c2, S1: s1, S2: s2, S2d: rc5.DeriveCode2(s1, s2)}
 }
 
-func (b *Builder) nextSeq() uint32 { b.seq++; return b.seq }
+func (b *Builder) nextSeq() uint32 { return b.seq.Add(1) }
 
 // build lays out a frame, fills via fn, stamps chkval, encrypts.
 func (b *Builder) build(ftype byte, total int, fn func([]byte)) []byte {
@@ -289,5 +294,6 @@ func ParseAlarm(b []byte) (*Alarm, error) {
 }
 
 // SeqNext exposes the per-session sequence counter (for callers
-// building custom frames with the same numbering space).
-func (b *Builder) SeqNext() uint32 { b.seq++; return b.seq }
+// building custom frames with the same numbering space). 并发安全：
+// 内部走原子递增（与 build/nextSeq 同一计数空间）。
+func (b *Builder) SeqNext() uint32 { return b.nextSeq() }

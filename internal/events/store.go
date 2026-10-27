@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,10 @@ type Store struct {
 	// bus is referenced for insert notifications via Engine; kept here to
 	// avoid an import cycle by wiring in NewEngine.
 	mu sync.Mutex
+
+	// skipRaw 为 true 时按配置 events.keep_raw=false 跳过 raw 字段存储。
+	// 零值 false 即默认存 raw，保持既有行为不变。
+	skipRaw atomic.Bool
 }
 
 // Open creates/opens the database at path (WAL mode) and migrates.
@@ -67,10 +72,15 @@ CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
 	return err
 }
 
+// SetKeepRaw 应用配置 events.keep_raw：false 时跳过 raw 字段存储以省磁盘。
+// 默认（未调用）保持存 raw 的现状语义。
+func (s *Store) SetKeepRaw(keep bool) { s.skipRaw.Store(!keep) }
+
 // Insert stores an event; on success sets ev.ID.
 func (s *Store) Insert(ev *Event) error {
 	var raw any
-	if len(ev.Raw) > 0 {
+	// keep_raw=false 时跳过原始报文存储（读取侧 raw 允许为空）
+	if len(ev.Raw) > 0 && !s.skipRaw.Load() {
 		raw = ev.Raw
 	}
 	res, err := s.db.Exec(
@@ -118,6 +128,37 @@ func (s *Store) Query(device, typ string, sinceID int64, limit int) ([]Event, er
 	return out, rows.Err()
 }
 
+// QuerySince 按事件 id 升序返回 sinceID 之后最近 limit 条事件。
+// 供 WS 断线补拉使用：取「最近」limit 条而非最早，超出回放窗口的更早
+// 事件由客户端转 REST /api/events 查询（快照语义兜底）。
+func (s *Store) QuerySince(sinceID int64, limit int) ([]Event, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT id, COALESCE(msg_id,''), device_id, type, COALESCE(ts_event,0), ts_recv, COALESCE(payload,'')
+	      FROM events WHERE id > ? ORDER BY id DESC LIMIT ?`, sinceID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		var ev Event
+		if err := rows.Scan(&ev.ID, &ev.MsgID, &ev.DeviceID, &ev.Type, &ev.TSEvent, &ev.TSRecv, &ev.Payload); err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// SQL 取 DESC（最近优先），反转成升序返回，便于按时间顺序回放
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // RawHex returns the stored raw payload of one event (for the UI's
 // "unknown" inspector).
 func (s *Store) RawHex(id int64) (string, error) {
@@ -127,6 +168,15 @@ func (s *Store) RawHex(id int64) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
+}
+
+// CountEvents 返回 events 表总行数（O(1) 计数查询，供 /metrics 使用）。
+// 替代旧路径"Query 拉取最多 1000 行再数长度"——旧路径既非总量语义，
+// 又让每次指标抓取全表捞 1000 行。
+func (s *Store) CountEvents() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&n)
+	return n, err
 }
 
 // Cleanup enforces retention_days and max_rows.
@@ -166,6 +216,23 @@ func (s *Store) TouchClient(id string) error {
 // CloseClient marks a client disconnected.
 func (s *Store) CloseClient(id string) error {
 	_, err := s.db.Exec(`UPDATE clients SET active=0, last_active=? WHERE id=?`, time.Now().Unix(), id)
+	return err
+}
+
+// SweepStaleClients 把 last_active 超过 ttl 仍标记活跃的 web 客户端置为
+// 断开（兜底清理：活跃 WS 连接由 ping 周期刷新 last_active，不会被误清；
+// 只清 web 类是因为 rtsp/onvif 长会话期间不刷新 last_active，无法区分
+// 活跃观看与僵尸行——那类残留由启动时的 SweepAllClientsInactive 处理）。
+func (s *Store) SweepStaleClients(ttl time.Duration) error {
+	_, err := s.db.Exec(`UPDATE clients SET active=0
+		WHERE active=1 AND kind='web' AND last_active < ?`, time.Now().Add(-ttl).Unix())
+	return err
+}
+
+// SweepAllClientsInactive 把所有仍标记活跃的客户端行置为断开。
+// 进程启动时调用：上次运行（如崩溃）来不及 CloseClient 的残留行在此清零。
+func (s *Store) SweepAllClientsInactive() error {
+	_, err := s.db.Exec(`UPDATE clients SET active=0 WHERE active=1`)
 	return err
 }
 
