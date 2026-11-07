@@ -62,7 +62,11 @@ docker compose up -d --build
 
 > 也可直接 `export KONX_CLOUD_PASS='<明文密码>'`，网关仅在内存中转 MD5，不落盘。
 
-**首次启动日志会打印两个一次性凭据，请立即保存：**
+Docker 可使用 bridge，无需 host。P2P 视频除三个 TCP 服务端口外，还需同端口映射 IPv4 UDP `51880–51979`；仅映射 Web、RTSP、ONVIF 端口不足以保证设备握手包进入容器。详见 [bridge 部署说明](deploy/README.md#bridge-网络)。
+
+可用 `KONX_ADMIN_PASSWORD` 指定 Web 管理密码、`KONX_NVR_PASSWORD` 指定 RTSP/ONVIF 用户 `nvr` 的密码。直接填写明文，无长度、复杂度要求，也无需自行哈希或加密。Compose 示例会传入这两个变量；保持变量值不变，重建容器或数据目录后也可沿用下游凭据。
+
+**未设置对应环境变量时，首次启动日志会打印随机生成的凭据，请保存：**
 
 1. Web 管理密码（admin 登录 `http://<主机>:8080/`）
 2. RTSP/ONVIF 用户 `nvr` 的密码（拉流与 HA 配置都要用）
@@ -175,6 +179,10 @@ advertise:
 | `KONX_MEDIA_SOURCE` / `KONX_MEDIA_EXTERNAL_URL` | 覆盖媒体源 / 上游地址 |
 | `KONX_MQTT_BROKER` | 设置即启用 MQTT |
 | `KONX_WEB_LISTEN` / `KONX_DATA_DIR` / `KONX_LOG_LEVEL` | Web 端口 / 数据目录 / 日志级别 |
+| `KONX_ADMIN_PASSWORD` | Web 管理密码，明文，启动时优先于数据库 |
+| `KONX_NVR_PASSWORD` | RTSP/ONVIF 用户 `nvr` 的密码，明文，启动时优先于数据库 |
+
+这两个密码变量只覆盖当前运行，不写入数据库或打印到日志。修改后需重新创建容器使新环境生效。未设置时沿用数据库凭据，数据库没有凭据才随机生成；显式设置空字符串表示使用空密码，空格和特殊字符原样保留。
 
 ## 媒体源与 P2P 节流（重要）
 
@@ -230,8 +238,8 @@ cp -r custom_components/konx /config/custom_components/
 ## 安全须知
 
 - **云端凭据**：密码只以 MD5 形态参与登录协议；推荐 `KONX_CLOUD_USER` + `KONX_CLOUD_PASS_MD5` 环境变量注入，明文入口 `KONX_CLOUD_PASS` 仅内存转换、从不落盘。日志全量脱敏（MD5、sid、code、token）。
-- **RTSP/ONVIF 凭据**：`nvr` 密码由网关首次启动随机生成并**仅打印一次**，明文存于数据目录 SQLite `kv` 表（`nvr_password`）。
-- **Web 管理**：bcrypt 口令（首启随机生成打印一次），登录限速 5 次/分钟/IP。
+- **RTSP/ONVIF 凭据**：优先使用 `KONX_NVR_PASSWORD`；未设置时读取 SQLite `kv` 表的 `nvr_password`，缺失才随机生成并打印一次。
+- **Web 管理**：优先使用 `KONX_ADMIN_PASSWORD`；未设置时沿用数据库 bcrypt 凭据，缺失才随机生成并打印一次。登录限速 5 次/分钟/IP。
 - **API**：Bearer Token，scope=read/talk/admin，可吊销；HA 用只读+talk 即可。
 - 与手机 App 共用账号会互踢；建议为网关单独注册账号。
 - 定位家庭内网服务，不做公网暴露；TLS 交由可选反代。

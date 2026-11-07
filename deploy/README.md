@@ -12,10 +12,18 @@ export KONX_CLOUD_PASS_MD5=$(printf '%s' '<密码>' | md5sum | cut -d' ' -f1)
 docker compose up -d --build
 ```
 
-首次启动日志会打印两个一次性凭据（错过不再显示，忘记只能重置数据目录）：
+可直接设置明文环境变量 `KONX_ADMIN_PASSWORD` 和 `KONX_NVR_PASSWORD` 固定两个网关密码，无长度、复杂度要求，也无需自行哈希或加密。它们在每次启动时优先于数据库，修改后重新创建容器即可生效；不会改写数据库或打印配置的密码。显式空字符串也是有效密码，未设置才沿用数据库或首次随机生成。
+
+未设置对应环境变量且数据库没有凭据时，首次启动日志会打印两个随机凭据：
 
 - **admin 管理密码** —— Web 登录 `http://<宿主机>:8080/`
 - **RTSP/ONVIF 用户 `nvr` 的密码** —— 拉流与 HA 配置使用
+
+### bridge 网络
+
+不要求 host 网络。使用 `media.source: p2p-av` 时，除 Web、RTSP、ONVIF 的 TCP 端口外，还需同端口映射 IPv4 UDP `51880–51979`，见 Compose 示例。网关并行探测服务器，在该范围内选择可用端口，设备会向服务器交付的地址发送握手与媒体包；仅发布三个 TCP 端口时，可能出现云端已登录但视频建链超时。此项为宿主机到容器的映射，不要求额外配置路由器端口转发。
+
+HTTP 与 RTSP 对外端口不同时，在 `advertise.host/http_port/rtsp_port` 中填写客户端实际访问的宿主机地址和端口。例如 `18080:8080` 对应 `web.listen: :8080`、`advertise.http_port: 18080`。下游 RTSP 使用 TCP；ONVIF 使用服务地址手动添加，不提供组播自动发现。
 
 容器端口映射（见 `docker-compose.yml`）：
 
@@ -58,6 +66,9 @@ Environment=KONX_CLOUD_USER=86-13800000000
 Environment=KONX_CLOUD_PASS_MD5=0123456789abcdef0123456789abcdef
 #   或明文（网关仅内存转 MD5，不落盘；unit 文件权限务必 600）
 #Environment=KONX_CLOUD_PASS=明文密码
+# 可选：固定网关密码，直接填明文
+#Environment=KONX_ADMIN_PASSWORD=管理密码
+#Environment=KONX_NVR_PASSWORD=媒体密码
 
 # 崩溃自动拉起（推送会话具备断线自愈，重启无害）
 Restart=on-failure
@@ -108,7 +119,7 @@ journalctl -u konx-gw -f                        # 首启打印 admin/nvr 两个�
 - **P2P 呼叫节流**：完整拆链后 15–30 分钟内重呼会被服务器拉黑（登录后零推送）。保持 `media.p2p.hard_idle` ≥15m、避免频繁观看；`session_hold` 常驻会话模式开发中。详见根 README「媒体源与 P2P 节流」。
 - 设备 RTSP 并发=1：`media.source=device-rtsp` 需显式 `device_rtsp_exclusive_ack: true`，否则拒绝启动（保护 NVR 与设备）。`p2p-av` 不受此限。
 - 与手机 App 共用账号会互踢；验证通过后建议切换独立账号（仅改 env）。
-- 忘记 `nvr`/admin 密码：停止服务，删除数据目录中 SQLite 的 `kv` 表对应记录（或备份事件库后整体重置数据目录），重启即重新生成并再次打印。
+- 忘记 `nvr`/admin 密码：设置 `KONX_NVR_PASSWORD` / `KONX_ADMIN_PASSWORD` 并重新创建容器即可覆盖，保留原数据库。
 
 ## 相关文档
 

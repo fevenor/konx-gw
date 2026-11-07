@@ -472,9 +472,12 @@ services:
       - "8080:8080"                  # Web/REST/WS
       - "8554:8554"                  # RTSP(下游客户端)
       - "8000:8000"                  # ONVIF
+      - "0.0.0.0:51880-51979:51880-51979/udp" # P2P 设备握手与媒体
     environment:
       - KONX_CLOUD_USER=${KONX_CLOUD_USER}
       - KONX_CLOUD_PASS_MD5=${KONX_CLOUD_PASS_MD5}
+      - KONX_ADMIN_PASSWORD
+      - KONX_NVR_PASSWORD
       - TZ=Asia/Shanghai
     volumes:
       - ./data:/data
@@ -484,7 +487,9 @@ services:
 ```
 
 - 镜像：多阶段构建（golang:1.23 builder → distroless + ffmpeg 静态二进制）；**仅 `full` 一档**（2026-10-24 决策）。
-- 出网需求（防火墙清单）：`api*.cloudlinks.cn:443/tcp`、列表服务器 `:51701/tcp+udp`、P2P 服务器 `udp 高位动态`；入网映射 8080/8554/8000，无组播（WS-Discovery 不提供）。
+- 出网需求（防火墙清单）：`api*.cloudlinks.cn:443/tcp`、列表服务器 `:51701/tcp+udp`、P2P 服务器 `udp 高位动态`；宿主机到容器映射 TCP 8080/8554/8000 与 IPv4 UDP 51880–51979，无组播（WS-Discovery 不提供）。
+- bridge 可用于 P2P 视频；程序并行探测服务器时在 UDP 51880–51979 内分配端口，同端口映射确保设备首包能进入容器，无需强制 host。
+- 两个网关密码可分别通过明文 `KONX_ADMIN_PASSWORD`、`KONX_NVR_PASSWORD` 指定，启动时覆盖数据库，无强度限制。未设置则沿用数据库或首次随机生成。
 - 桥接映射下，ONVIF GetStreamUri/快照/RTSP 地址经 `advertise` 配置公告（宿主 IP + 映射端口；端口一一映射时只需填 host）。
 - 升级：单一二进制+静态资源，SQLite 迁移向前兼容；数据卷仅 `/data`。
 - HA 侧：`configuration.yaml` 无需改动，组件放入 `custom_components/konx/` 重启即可。

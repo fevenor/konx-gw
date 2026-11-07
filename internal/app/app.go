@@ -62,13 +62,18 @@ func Build(cfg *config.App, log *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	// RTSP/ONVIF users: reuse loopback + a default "nvr" user created at
-	// first boot with a generated password (printed once).
-	nvrPass, _ := store.KVGet("nvr_password")
-	if nvrPass == "" {
-		nvrPass = authSvc.CreateSecret()
-		_ = store.KVSet("nvr_password", nvrPass)
-		fmt.Printf("=== konx-gw RTSP/ONVIF user 'nvr' password (shown once): %s ===\n", nvrPass)
+	// 环境变量仅覆盖本次运行，不改写已有数据库凭据。
+	nvrPass, configured := os.LookupEnv("KONX_NVR_PASSWORD")
+	if !configured {
+		nvrPass, _ = store.KVGet("nvr_password")
+		if nvrPass == "" {
+			nvrPass = authSvc.CreateSecret()
+			if err := store.KVSet("nvr_password", nvrPass); err != nil {
+				store.Close()
+				return nil, err
+			}
+			fmt.Printf("=== konx-gw RTSP/ONVIF user 'nvr' password (shown once): %s ===\n", nvrPass)
+		}
 	}
 	authSvc.SetUser("nvr", nvrPass)
 

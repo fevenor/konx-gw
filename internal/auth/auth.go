@@ -1,6 +1,5 @@
-// Package auth implements the gateway credential model (DESIGN §12):
-// bcrypt admin password, scoped API tokens, RTSP/ONVIF users shared with
-// the token table, and a fixed loopback identity for internal pipelines.
+// Package auth 提供环境变量或数据库管理密码、分权限 API 令牌、
+// RTSP/ONVIF 用户，以及内部媒体管道的回环身份。
 package auth
 
 import (
@@ -11,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,11 +33,12 @@ type Service struct {
 	store *events.Store
 	log   *slog.Logger
 
-	mu           sync.Mutex
-	adminHash    []byte
-	users        map[string]string // rtsp/onvif basic users → pass
-	loopbackUser string
-	loopbackPass string
+	mu            sync.Mutex
+	adminHash     []byte
+	adminOverride *string
+	users         map[string]string // rtsp/onvif basic users → pass
+	loopbackUser  string
+	loopbackPass  string
 
 	loginMu   sync.Mutex
 	loginLast map[string][]time.Time // ip → attempts
@@ -48,6 +49,11 @@ func New(store *events.Store, log *slog.Logger) (*Service, error) {
 	// loopback identity for internal ffmpeg pipelines
 	s.loopbackUser = "loopback"
 	s.loopbackPass = randHex(16)
+	// 显式环境变量优先，原样使用（包括空串）；不覆盖数据库中的凭据。
+	if pw, ok := os.LookupEnv("KONX_ADMIN_PASSWORD"); ok {
+		s.adminOverride = &pw
+		return s, nil
+	}
 	// restore or create admin password
 	hash, _ := store.KVGet("admin_password_hash")
 	if hash == "" {
@@ -77,6 +83,7 @@ func (s *Service) SetAdminPassword(pw string) error {
 	}
 	s.mu.Lock()
 	s.adminHash = h
+	s.adminOverride = nil
 	s.mu.Unlock()
 	return nil
 }
@@ -85,7 +92,11 @@ func (s *Service) SetAdminPassword(pw string) error {
 func (s *Service) CheckAdmin(pw string) bool {
 	s.mu.Lock()
 	h := s.adminHash
+	override := s.adminOverride
 	s.mu.Unlock()
+	if override != nil {
+		return pw == *override
+	}
 	return bcrypt.CompareHashAndPassword(h, []byte(pw)) == nil
 }
 
