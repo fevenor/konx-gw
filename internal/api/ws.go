@@ -69,9 +69,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
+		queueSize := wsQueueSize
+		if replaySince >= 0 && queueSize < wsReplayLimit+1 {
+			// 首次状态加整批补拉可立即入队，避免正常历史回放被当作慢客户端。
+			queueSize = wsReplayLimit + 1
+		}
 		conn := &wsConn{
 			c:    c,
-			out:  make(chan wsOutMsg, wsQueueSize),
+			out:  make(chan wsOutMsg, queueSize),
 			done: make(chan struct{}),
 		}
 		s.wsMu.Lock()
@@ -106,6 +111,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// replaySeen 记录补拉期间已通过实时流收到的事件 id（补放回放
 		// 时据此跳过，保证回放与实时流衔接不重不漏）；回放完成后置 nil。
 		var replaySeen map[int64]bool
+		if replaySince >= 0 {
+			replaySeen = make(map[int64]bool)
+		}
 		unsub := s.d.Engine.Subscribe(func(ev events.Event) {
 			// seq 分配与入队必须在同一临界区原子完成，保证该连接内
 			// 消息按 seq 严格递增有序送达（C0-3）。入队为非阻塞尝试，
@@ -124,7 +132,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		// 订阅后入库的事件既在实时流也会出现在查询结果里（跳过），
 		// 两者合并恰好覆盖 since 之后的全部事件，不重不漏。
 		if replaySince >= 0 {
-			replaySeen = make(map[int64]bool)
 			missed, qerr := s.d.Store.QuerySince(replaySince, wsReplayLimit)
 			if qerr == nil {
 				s.wsMu.Lock()
@@ -139,7 +146,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				s.wsMu.Unlock()
 			} else {
 				slog.Default().Warn("断线补拉查询失败，跳过回放", "since", replaySince, "err", qerr)
+				s.wsMu.Lock()
 				replaySeen = nil
+				s.wsMu.Unlock()
 			}
 		}
 

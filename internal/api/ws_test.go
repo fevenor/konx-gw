@@ -406,3 +406,48 @@ func TestWSSinceReplayAndLiveHandoff(t *testing.T) {
 		}
 	}
 }
+
+// 整个补拉窗口应能入队，客户端稍后开始读取也不会被当作慢消费者断开。
+func TestWSFullReplayWindow(t *testing.T) {
+	s, eng, _, url := newWSTestEnv(t, true)
+	for i := 0; i < wsReplayLimit; i++ {
+		ev := uniqEvent(i)
+		ev.Payload = fmt.Sprintf(`{"data":%q}`, strings.Repeat("x", 4096))
+		eng.Submit(ev)
+	}
+	c := dialWS(t, url+"&since=0")
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	// 暂不消费，等待服务端积压超过实时队列容量，或观察到连接已被错误关闭。
+	if !waitCond(t, 3*time.Second, func() bool {
+		s.wsMu.Lock()
+		defer s.wsMu.Unlock()
+		if len(s.wsConns) == 0 {
+			return true
+		}
+		for conn := range s.wsConns {
+			if len(conn.out) > wsQueueSize {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("历史补拉未就绪")
+	}
+	for i := 0; i <= wsReplayLimit; i++ {
+		var msg map[string]any
+		if err := c.ReadJSON(&msg); err != nil {
+			t.Fatalf("整批补拉在第 %d 条中断: %v", i, err)
+		}
+		if i == 0 {
+			if msg["type"] != "state.changed" {
+				t.Fatalf("首条缺少状态快照: %v", msg["type"])
+			}
+			continue
+		}
+		data, _ := msg["data"].(map[string]any)
+		if msg["type"] != "event.new" || data["type"] != fmt.Sprintf("t%d", i-1) {
+			t.Fatalf("第 %d 条事件丢失或乱序", i)
+		}
+	}
+}

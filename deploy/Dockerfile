@@ -1,4 +1,4 @@
-# konx-gw image (single "full" flavor: Go binary + ffmpeg)
+# 完整镜像：网关二进制与 ffmpeg，两种架构均在对应 runner 上原生构建。
 FROM golang:1.26 AS build
 WORKDIR /src
 COPY go.mod go.sum ./

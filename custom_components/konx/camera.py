@@ -66,8 +66,7 @@ class KonxCamera(Camera):
             via_device=(DOMAIN, f"konx-gw-{entry.data[CONF_HOST]}"),
         )
 
-    @property
-    def stream_source(self) -> str | None:
+    async def stream_source(self) -> str | None:
         return self._rtsp
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:

@@ -28,10 +28,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry) -> bool:
     coord = KonxCoordinator(hass, entry.data)
-    await coord.async_config_entry_first_refresh()
-    hass.data[DOMAIN][entry.entry_id] = coord
-    await coord.start_ws()
-    await hass.config_entries.async_forward_platforms(entry, PLATFORMS)
+    try:
+        await coord.async_config_entry_first_refresh()
+        hass.data[DOMAIN][entry.entry_id] = coord
+        # 先注册实体的事件处理器，再接收实时消息。
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        await coord.start_ws()
+    except Exception:
+        await coord.stop()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
     entry.async_on_unload(entry.add_update_listener(_async_reload))
     return True
 
@@ -42,9 +48,9 @@ async def _async_reload(hass, entry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry) -> bool:
     coord: KonxCoordinator | None = hass.data[DOMAIN].get(entry.entry_id)
-    if coord:
-        await coord.stop()
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
+        if coord:
+            await coord.stop()
         hass.data[DOMAIN].pop(entry.entry_id)
     return unloaded

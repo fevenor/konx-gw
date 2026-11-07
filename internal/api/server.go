@@ -138,7 +138,7 @@ func (s *Server) routes() {
 	m.HandleFunc("/api/devices", s.methodRouter(map[string]http.HandlerFunc{
 		http.MethodGet: A.Require(auth.ScopeRead, s.handleDevices),
 	}))
-	m.Handle("/api/devices/{id}/snapshot", A.Require(auth.ScopeRead, s.handleSnapshot))
+	m.Handle("/api/devices/{id}/snapshot", A.RequireSnapshot(s.handleSnapshot))
 	m.Handle("/api/devices/{id}/stream.mjpeg", A.Require(auth.ScopeRead, s.handleMJPEG))
 	m.Handle("/api/devices/{id}/hls/{profile}/{file}", A.Require(auth.ScopeRead, s.handleHLSFile))
 	m.Handle("/api/devices/{id}/hls-start", A.Require(auth.ScopeRead, s.handleHLSStart))
@@ -441,7 +441,17 @@ func (s *Server) handleHLSStart(w http.ResponseWriter, r *http.Request) {
 	// Acquire 返回的释放函数，源引用只增不减，源永不空闲停止（C1-2）。
 	s.hlsMu.Lock()
 	if _, ok := s.hlsRefs[key]; ok {
+		// 引用代表观看意图；进程可能已经退出，Ensure 负责检查并重启。
+		_, err := s.d.HLS.Ensure(key, s.d.Rtsp.LoopbackURL(id, prof, lu, lp))
+		if err != nil {
+			s.hlsRefs[key]()
+			delete(s.hlsRefs, key)
+		}
 		s.hlsMu.Unlock()
+		if err != nil {
+			writeJSONErr(w, 500, "hls_failed", err.Error())
+			return
+		}
 		writeJSON(w, 200, map[string]string{"playlist": playlist})
 		return
 	}
@@ -474,13 +484,13 @@ func (s *Server) handleHLSStop(w http.ResponseWriter, r *http.Request) {
 	s.hlsMu.Lock()
 	rel, ok := s.hlsRefs[key]
 	delete(s.hlsRefs, key)
-	s.hlsMu.Unlock()
 	if ok {
 		rel()
 	}
 	if s.d.HLS != nil {
 		s.d.HLS.Stop(key)
 	}
+	s.hlsMu.Unlock()
 	writeJSON(w, 200, map[string]string{"status": "stopped"})
 }
 
@@ -488,12 +498,20 @@ func (s *Server) handleHLSFile(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	prof := media.Profile(r.PathValue("profile"))
 	file := r.PathValue("file")
+	if prof != media.ProfileMain && prof != media.ProfileSub {
+		http.NotFound(w, r)
+		return
+	}
 	if file != "index.m3u8" && !strings.HasSuffix(file, ".ts") {
 		http.NotFound(w, r)
 		return
 	}
 	key := id + "|" + string(prof)
-	playlist, _ := s.d.HLS.Ensure(key, "")
+	playlist, ok := s.d.HLS.Playlist(key)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
 	http.ServeFile(w, r, playlist[:len(playlist)-len("index.m3u8")]+file)
 }
 

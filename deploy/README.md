@@ -115,3 +115,28 @@ journalctl -u konx-gw -f                        # 首启打印 admin/nvr 两个�
 - 配置项总表与故障排查：[../README.md](../README.md)
 - 设计文档：[../docs/DESIGN.md](../docs/DESIGN.md)
 - P2P 协议技术档案另行内部维护
+
+## GitHub Actions 镜像
+
+仓库的 `.github/workflows/images.yml` 使用两个原生 runner 构建 amd64 和 arm64，沿用本 Dockerfile。两种架构均成功后合并为多架构镜像，拉取时 Docker 自动选择主机架构。
+
+工作流仅接受手动触发，push、PR 和推送标签均不会自动运行。每次执行先运行 Go 构建、静态检查、测试及 HA 接口回归测试，再构建并发布镜像。
+
+在 GitHub 仓库的 **Actions → 检查与双架构镜像 → Run workflow** 选择分支即可运行；也可使用 GitHub CLI：`gh workflow run images.yml --ref main`。
+
+- 选择 `main`：发布 `ghcr.io/<仓库所有者>/konx-gw:latest` 和 `sha-<完整提交号>`。
+- 选择其他分支：只发布提交标签。
+- 通过 CLI 选择版本标签（如 `--ref v1.0.0`）：同时发布同名版本标签。
+
+工作流使用内置 `GITHUB_TOKEN` 登录 GHCR，需允许该仓库写入 Packages。仓库名称会自动转换为小写；Fork 后镜像路径随仓库名称变化。每次构建的中间架构标签以 `build-` 开头。
+
+首次发布后可用以下命令拉取；若包保持私有，需先登录 GHCR：
+
+```bash
+docker pull ghcr.io/<仓库所有者>/konx-gw:latest
+docker buildx imagetools inspect ghcr.io/<仓库所有者>/konx-gw:latest
+```
+
+ONVIF 返回的快照 URL 支持网关已有的 nvr Basic 凭据；原有 API read 令牌也可使用。媒体凭据仅增加快照读取权限。MQTT 的“媒体连接”实体表示取流连接状态，空闲未取流时为关闭，不能作为设备物理离线的判据。
+
+本地 HA 接口回归测试使用最小 HA 接口替身及模拟事件，可运行 `uv run --no-project --with aiohttp python -m unittest discover -s tests -v`（在仓库根目录）。它验证初始化、直播地址接口、补拉及去重，不替代真实 Home Assistant 和门铃按键验收。

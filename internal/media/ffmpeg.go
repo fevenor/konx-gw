@@ -76,19 +76,20 @@ func NewHLSManager(ff *FFmpeg, outRoot string) *HLSManager {
 // least one viewer is expected; Stop drops it.
 func (h *HLSManager) Ensure(key, src string) (string, error) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if _, ok := h.sessions[key]; ok {
-		h.mu.Unlock()
 		return h.playlistPath(key), nil
+	}
+	if src == "" {
+		return "", fmt.Errorf("HLS 缺少媒体源地址")
 	}
 	dir := filepath.Join(h.outRoot, "hls", key)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		h.mu.Unlock()
 		return "", err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ss := &hlsSession{cancel: cancel, done: make(chan struct{})}
 	h.sessions[key] = ss
-	h.mu.Unlock()
 
 	cmd := exec.CommandContext(ctx, h.ff.Path,
 		"-rtsp_transport", "tcp",
@@ -103,14 +104,13 @@ func (h *HLSManager) Ensure(key, src string) (string, error) {
 		filepath.Join(dir, "index.m3u8"),
 	)
 	if err := cmd.Start(); err != nil {
-		h.mu.Lock()
 		delete(h.sessions, key)
-		h.mu.Unlock()
 		cancel()
 		return "", err
 	}
 	go func() {
 		defer close(ss.done)
+		defer cancel()
 		_ = cmd.Wait()
 		h.mu.Lock()
 		if cur, ok := h.sessions[key]; ok && cur == ss {
@@ -119,6 +119,14 @@ func (h *HLSManager) Ensure(key, src string) (string, error) {
 		h.mu.Unlock()
 	}()
 	return h.playlistPath(key), nil
+}
+
+// Playlist 只查询已启动的管线；读取文件不会创建进程。
+func (h *HLSManager) Playlist(key string) (string, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	_, ok := h.sessions[key]
+	return h.playlistPath(key), ok
 }
 
 // Stop terminates the HLS pipeline for key.

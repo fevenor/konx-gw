@@ -215,6 +215,11 @@ func (s *rtspSource) pull(ctx context.Context) error {
 	s.desc = desc
 	sink := s.sink
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.desc = nil
+		s.mu.Unlock()
+	}()
 
 	c.OnPacketRTPAny(func(m *description.Media, _ format.Format, pkt *rtp.Packet) {
 		if sink != nil {

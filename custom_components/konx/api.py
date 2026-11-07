@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 import aiohttp
 
-from .const import API_STATE, WS_PATH
+from .const import API_EVENTS, API_STATE, WS_PATH
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class KonxClient:
         ) as resp:
             resp.raise_for_status()
             data = await resp.json()
-            return data.get("events", [])
+            return data.get("events") or []
 
     async def snapshot_jpeg(self, device_id: str, stream: str = "main") -> bytes | None:
         session = await self._ensure_session()
@@ -90,7 +90,7 @@ class KonxClient:
             return resp.status == 200
 
     async def listen_events(
-        self, on_event: Callable[[dict], None], since: int | None = None
+        self, on_event: Callable[[dict], None], since: int | Callable[[], int] | None = None
     ) -> None:
         """Long-lived websocket with exponential backoff reconnect.
 
@@ -102,15 +102,20 @@ class KonxClient:
             try:
                 session = await self._ensure_session()
                 ws_url = self.base.replace("http", "ws") + WS_PATH
-                if since is not None:
-                    ws_url += f"?since={since}"
+                cursor = since() if callable(since) else since
+                if cursor is not None:
+                    ws_url += f"?since={cursor}"
                 async with session.ws_connect(ws_url, headers=self.headers) as ws:
-                    _LOGGER.debug("konx-gw websocket connected (since=%s)", since)
+                    _LOGGER.debug("konx-gw websocket connected (since=%s)", cursor)
                     backoff = 2
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
-                                on_event(json.loads(msg.data))
+                                event = json.loads(msg.data)
+                                on_event(event)
+                                # 每次重连使用已接收的事件位置；函数游标同时涵盖 REST 补拉。
+                                if not callable(since) and event.get("type") == "event.new":
+                                    since = max(since or 0, int(event.get("data", {}).get("id", 0)))
                             except ValueError:
                                 continue
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):

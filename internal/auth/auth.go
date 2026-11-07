@@ -220,6 +220,27 @@ type ctxKey int
 
 const scopesKey ctxKey = 1
 
+// RequireSnapshot 仅给快照端点增加 nvr 等已有媒体用户的 Basic 鉴权。
+// Bearer 令牌仍走 read scope 校验，媒体凭据不获得其他 API 权限。
+func (s *Service) RequireSnapshot(next http.HandlerFunc) http.HandlerFunc {
+	read := s.Require(ScopeRead, next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if user, pass, ok := r.BasicAuth(); ok {
+			if user != "" && s.CheckRTSP(user, pass) {
+				next(w, r)
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Basic realm="konx-gw"`)
+			writeErr(w, http.StatusUnauthorized, "bad_credentials", "invalid media credentials")
+			return
+		}
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="konx-gw"`)
+		}
+		read(w, r)
+	}
+}
+
 // Require returns a handler wrapper demanding the given scope.
 func (s *Service) Require(scope string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

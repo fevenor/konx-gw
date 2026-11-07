@@ -238,7 +238,7 @@ func Build(cfg *config.App, log *slog.Logger) (*App, error) {
 				return fmt.Sprintf("rtsp://%s:%d/konx/%s/%s", onvifHost(host), cfg.AdvertisedRTSPPort(), dev, p)
 			},
 			SnapshotURL: func(dev string, p media.Profile) string {
-				return fmt.Sprintf("http://%s:%d/api/devices/%s/snapshot", onvifHost(host), cfg.AdvertisedHTTPPort(), dev)
+				return fmt.Sprintf("http://%s:%d/api/devices/%s/snapshot?stream=%s", onvifHost(host), cfg.AdvertisedHTTPPort(), dev, p)
 			},
 		})
 	}
@@ -248,6 +248,14 @@ func Build(cfg *config.App, log *slog.Logger) (*App, error) {
 		a.MQTT = mqttx.New(cfg, log, mqttx.StateFuncs{
 			GWUp:  func() bool { return true },
 			P2PUp: func() bool { return a.Sess.State() == session.StateReady },
+			DeviceOnline: func(id string) bool {
+				for _, state := range a.Mgr.StateOf(id) {
+					if state == media.StateActive || state == media.StatePaused {
+						return true
+					}
+				}
+				return false
+			},
 		})
 		eng.Subscribe(a.MQTT.OnEvent)
 	}
@@ -332,29 +340,29 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 
-	// retention loop（事件保留清理）+ 客户端注册表 TTL 兜底清理：
-	// - 事件清理每 24 小时一次（保留天数/行数上限）；
-	// - web 客户端僵尸行每 5 分钟扫一次（活跃 WS 连接由 ping 周期刷新
-	//   last_active，TTL 取 10 分钟不会误清；清理的是 CloseClient 丢失
-	//   的残留行，例如写库失败或异常路径）。
-	go func() {
-		clientSweep := time.NewTicker(5 * time.Minute)
-		defer clientSweep.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(24 * time.Hour):
-				_ = a.Store.Cleanup(a.Cfg.Events.RetentionDays, a.Cfg.Events.MaxRows)
-			case <-clientSweep.C:
-				_ = a.Store.SweepStaleClients(10 * time.Minute)
-			}
-		}
-	}()
+	go a.maintain(ctx)
 
 	<-ctx.Done()
 	a.Shutdown()
 	return nil
+}
+
+// maintain 独立计时事件清理与客户端清理，短周期任务不重置长周期任务。
+func (a *App) maintain(ctx context.Context) {
+	clientSweep := time.NewTicker(5 * time.Minute)
+	defer clientSweep.Stop()
+	retention := time.NewTicker(24 * time.Hour)
+	defer retention.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-retention.C:
+			_ = a.Store.Cleanup(a.Cfg.Events.RetentionDays, a.Cfg.Events.MaxRows)
+		case <-clientSweep.C:
+			_ = a.Store.SweepStaleClients(10 * time.Minute)
+		}
+	}
 }
 
 // Shutdown stops subsystems gracefully.

@@ -15,22 +15,25 @@ import (
 )
 
 type Publisher struct {
-	cfg   *config.App
-	log   *slog.Logger
-	cli   paho.Client
-	base  string
-	gwUp  func() bool
-	p2pUp func() bool
+	cfg          *config.App
+	log          *slog.Logger
+	cli          paho.Client
+	base         string
+	gwUp         func() bool
+	p2pUp        func() bool
+	deviceOnline func(string) bool
 }
 
 // StateFuncs report session states for the status topic.
 type StateFuncs struct {
 	GWUp  func() bool
 	P2PUp func() bool
+	// DeviceOnline 表示媒体连接存活，不把网关在线等同于设备在线。
+	DeviceOnline func(string) bool
 }
 
 func New(cfg *config.App, log *slog.Logger, st StateFuncs) *Publisher {
-	return &Publisher{cfg: cfg, log: log, base: "konx-gw/" + cfg.GwID, gwUp: st.GWUp, p2pUp: st.P2PUp}
+	return &Publisher{cfg: cfg, log: log, base: "konx-gw/" + cfg.GwID, gwUp: st.GWUp, p2pUp: st.P2PUp, deviceOnline: st.DeviceOnline}
 }
 
 // Start connects (with LWT) and returns; offline until connected.
@@ -70,12 +73,22 @@ func (p *Publisher) PublishStatus() {
 	payload := fmt.Sprintf(`{"status":"online","gw":"%s","p2p":"%s","ts":%d}`,
 		p.cfg.GwID, p2p, time.Now().Unix())
 	p.cli.Publish(p.base+"/status", 1, true, payload)
+	for _, d := range p.cfg.Devices {
+		state := "OFF"
+		if p.deviceOnline != nil && p.deviceOnline(d.ID) {
+			state = "ON"
+		}
+		p.cli.Publish(fmt.Sprintf("%s/device/%s/availability", p.base, d.ID), 1, true, state)
+	}
 }
 
 // OnEvent fans one engine event out to MQTT.
 func (p *Publisher) OnEvent(ev events.Event) {
 	if p.cli == nil || !p.cli.IsConnected() {
 		return
+	}
+	if ev.Type == events.TypeSource || ev.Type == events.TypeCloudSession || ev.Type == events.TypeP2PSession {
+		p.PublishStatus()
 	}
 	topic := fmt.Sprintf("%s/device/%s/event/%s", p.base, ev.DeviceID, ev.Type)
 	payload := fmt.Sprintf(`{"msg_id":%q,"type":%q,"ts":%d,"payload":%s}`,
@@ -84,7 +97,7 @@ func (p *Publisher) OnEvent(ev events.Event) {
 	if ev.Type == events.TypeDoorbellPress {
 		// canonical doorbell topic (non-retain)
 		p.cli.Publish(fmt.Sprintf("%s/device/%s/event/doorbell", p.base, ev.DeviceID), 0, false,
-			fmt.Sprintf(`{"msg_id":%q,"ts":%d,"type":"press"}`, ev.MsgID, ev.TSRecv))
+			fmt.Sprintf(`{"msg_id":%q,"ts":%d,"type":"press","event_type":"press"}`, ev.MsgID, ev.TSRecv))
 	}
 }
 
@@ -93,18 +106,23 @@ func (p *Publisher) publishDiscovery() {
 	for _, d := range p.cfg.Devices {
 		// doorbell event entity
 		p.publishJSON(fmt.Sprintf("homeassistant/event/konx_%s_doorbell/config", d.ID), map[string]any{
-			"name":        d.Name + " Doorbell",
-			"state_topic": fmt.Sprintf("%s/device/%s/event/doorbell", p.base, d.ID),
-			"event_types": []string{"press"},
-			"device":      p.deviceInfo(d),
-			"unique_id":   "konx_" + d.ID + "_doorbell",
+			"name":                  d.Name + " Doorbell",
+			"state_topic":           fmt.Sprintf("%s/device/%s/event/doorbell", p.base, d.ID),
+			"event_types":           []string{"press"},
+			"device":                p.deviceInfo(d),
+			"unique_id":             "konx_" + d.ID + "_doorbell",
+			"availability_topic":    p.base + "/status",
+			"availability_template": "{{ value_json.status }}",
 		})
 		// online binary sensor
 		p.publishJSON(fmt.Sprintf("homeassistant/binary_sensor/konx_%s_online/config", d.ID), map[string]any{
-			"name":        d.Name + " Online",
-			"state_topic": fmt.Sprintf("%s/device/%s/availability", p.base, d.ID),
-			"device":      p.deviceInfo(d),
-			"unique_id":   "konx_" + d.ID + "_online",
+			"name":                  d.Name + " 媒体连接",
+			"device_class":          "connectivity",
+			"state_topic":           fmt.Sprintf("%s/device/%s/availability", p.base, d.ID),
+			"device":                p.deviceInfo(d),
+			"unique_id":             "konx_" + d.ID + "_online",
+			"availability_topic":    p.base + "/status",
+			"availability_template": "{{ value_json.status }}",
 		})
 	}
 }

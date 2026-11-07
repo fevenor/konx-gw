@@ -1,0 +1,12 @@
+.git
+.github
+/konx-gw
+**/__pycache__
+**/*.pyc
+**/*.db*
+**/*.log
+**/config.yaml
+data
+trace
+deploy/data
+.venv

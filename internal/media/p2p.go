@@ -208,6 +208,9 @@ func (s *p2pSource) Start() {
 				backoff = s.firstRetry
 			}
 			s.noteFailure()
+			s.mu.Lock()
+			s.resetMediaLocked()
+			s.mu.Unlock()
 			s.emit(StateError, err)
 			s.log.Warn("p2p source ended, retrying", "dev", s.devID, "err", err)
 			s.mu.Lock()
@@ -432,8 +435,9 @@ func (s *p2pSource) packetizeLocked(body []byte) []*rtp.Packet {
 		return p
 	}
 	if len(body) <= rtpMTU {
+		pkts := []*rtp.Packet{mk(body, true)}
 		s.pkt.ts += rtpTSStep
-		return []*rtp.Packet{mk(body, true)}
+		return pkts
 	}
 	// FU-A 分片
 	indicator := (body[0] & 0xe0) | fuIndicator

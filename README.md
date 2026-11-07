@@ -42,6 +42,12 @@
 | MQTT | ✅ 可选 | 状态/事件发布 + HA discovery（未配 broker 自动关闭） |
 | 对讲（网关→门铃放音） | ⏳ | 会话模型与 G.711 编码就绪，设备侧 Sink 待实现；当前 API 明确返回 501 |
 
+门铃事件目前按官方 SDK 的告警类型语义实现。由于无法操作真机按键，事件解析、去重、入库、推送和断线补拉以模拟消息验证，尚未完成真实按铃验收；不据此推断设备实际会发送哪些组合消息。现有补拉窗口仍为 WS 最近 500 条、HA 每轮 REST 最近 200 条。
+
+2026-11-07 实测通过云端登录、P2P 建链、设备密码自动解析、RTSP 持续解码、快照、MJPEG、HLS、网页预览及空闲暂停后恢复。ONVIF 查询/快照和 MQTT broker 接线已验证；HA 客户端已连接实际网关验证 HTTP/WS，完整 Home Assistant 实体、真实 NVR 及长期运行尚未验收。
+
+GitHub Actions 仅在手动触发时检查代码并构建 `linux/amd64`、`linux/arm64` 镜像，普通 push 不会执行，使用与标签规则见 [部署文档](deploy/README.md#github-actions-镜像)。
+
 ## 快速开始
 
 ### 方式一：Docker Compose（推荐）

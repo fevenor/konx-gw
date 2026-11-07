@@ -40,7 +40,9 @@ func (s *Server) mediaService(w http.ResponseWriter, r *http.Request, action, bo
 		if !ok {
 			return
 		}
-		reply(w, profileBody(dev, prof, s.videoEncoderXML(dev, prof)))
+		reply(w, `<s:Body><tmv:GetProfileResponse>`+
+			profileBody("Profile", dev, prof, s.videoEncoderXML(dev, prof))+
+			`</tmv:GetProfileResponse></s:Body>`)
 	case "GetStreamUri":
 		dev, prof, ok := s.requireProfile(w, body)
 		if !ok {
@@ -133,16 +135,16 @@ func (s *Server) getProfiles(w http.ResponseWriter, r *http.Request) {
 	var bodies string
 	for _, d := range s.env.Cfg.Devices {
 		for _, p := range []media.Profile{media.ProfileMain, media.ProfileSub} {
-			bodies += profileBody(d.ID, p, s.videoEncoderXML(d.ID, p))
+			bodies += profileBody("Profiles", d.ID, p, s.videoEncoderXML(d.ID, p))
 		}
 	}
 	reply(w, `<s:Body><tmv:GetProfilesResponse>`+bodies+`</tmv:GetProfilesResponse></s:Body>`)
 }
 
-func profileBody(dev string, p media.Profile, encoder string) string {
+func profileBody(element, dev string, p media.Profile, encoder string) string {
 	name := dev + "-" + string(p)
 	tok := "profile_" + dev + "_" + string(p)
-	return `<tmv:Profiles token="` + tok + `" fixed="true">` +
+	return `<tmv:` + element + ` token="` + tok + `" fixed="true">` +
 		`<tt:Name>` + xmlEscape(name) + `</tt:Name>` +
 		`<tt:VideoSourceConfiguration token="vsc_` + tok + `">` +
 		`<tt:Name>` + xmlEscape(name) + `</tt:Name><tt:SourceToken>vsrc_0</tt:SourceToken>` +
@@ -153,7 +155,7 @@ func profileBody(dev string, p media.Profile, encoder string) string {
 		`<tt:Bitrate>64000</tt:Bitrate><tt:SampleRate>8000</tt:SampleRate>` +
 		`</tt:AudioEncoderConfiguration>` +
 		`<tt:PTZConfiguration token="ptz_` + tok + `"><tt:Name>fixed</tt:Name></tt:PTZConfiguration>` +
-		`</tmv:Profiles>`
+		`</tmv:` + element + `>`
 }
 
 func (s *Server) videoEncoderXML(dev string, p media.Profile) string {

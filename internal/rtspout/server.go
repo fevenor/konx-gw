@@ -59,7 +59,7 @@ type streamEntry struct {
 // 账的出口键集合（同会话多 track 去重，每键恰一次 Acquire/Release）；
 // played 标记是否进入过 PLAY（hook 下行计数以 played 为准）。
 type sessionRec struct {
-	keys   map[string]bool
+	keys   map[string]*streamEntry
 	played bool
 }
 
@@ -167,10 +167,14 @@ func (s *Server) streamFor(dev string, prof media.Profile) (*streamEntry, error)
 	key := dev + "|" + string(prof)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e, ok := s.streams[key]; ok {
-		return e, nil
-	}
 	desc := s.mgr.Desc(dev, prof)
+	if e, ok := s.streams[key]; ok {
+		if e.ss.Desc == desc {
+			return e, nil
+		}
+		// 重连后描述对象换代，关闭旧读会话，让客户端重新协商轨道。
+		s.closeEntryLocked(key, dev, prof)
+	}
 	if desc == nil {
 		return nil, errNotReady
 	}
@@ -180,10 +184,17 @@ func (s *Server) streamFor(dev string, prof media.Profile) (*streamEntry, error)
 	}
 	// route upstream packets into the server stream
 	s.mgr.RegisterWriter(dev, prof, func(md *description.Media, pkt *rtp.Packet) {
-		// gortsplib v4 ServerStream 在 Close 后再写会内部 panic（nil
-		// deref）：观众断开→拆条目与呼叫拆链尾包竞态属正常时序，
-		// egress 是尽力而为路径——吞掉已关闭流的写入 panic。
-		defer func() { _ = recover() }()
+		// 描述换代与尾包可交错；只向本条目的轨道写包。
+		known := false
+		for _, track := range desc.Medias {
+			if track == md {
+				known = true
+				break
+			}
+		}
+		if !known {
+			return
+		}
 		if err := ss.WritePacketRTP(md, pkt); err != nil {
 			s.log.Debug("write rtp", "err", err)
 		}
@@ -235,8 +246,8 @@ func (s *Server) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	rec, ok := s.sessions[ctx.Session]
 	delete(s.sessions, ctx.Session)
 	if ok {
-		for key := range rec.keys {
-			if e, exists := s.streams[key]; exists {
+		for key, heldEntry := range rec.keys {
+			if e, exists := s.streams[key]; exists && e == heldEntry {
 				if e.viewers > 0 {
 					e.viewers--
 				}
@@ -354,10 +365,10 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 	// ① 同会话多 track 去重：该键已记账 → 直接复用既有流（不重复
 	// Acquire，修「每 track 一次 Acquire 只配一次 Release」的引用泄漏）
 	s.mu.Lock()
-	if rec, held := s.sessions[ctx.Session]; held && rec.keys[key] {
+	if rec, held := s.sessions[ctx.Session]; held && rec.keys[key] != nil {
 		e, exists := s.streams[key]
 		s.mu.Unlock()
-		if exists {
+		if exists && e == rec.keys[key] {
 			return &base.Response{StatusCode: base.StatusOK}, e.ss, nil
 		}
 		// 已记账但条目已被源停拆（防御路径）：源引用仍由会话记账持
@@ -389,10 +400,10 @@ func (s *Server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 	if cur, exists := s.streams[key]; exists && cur == e {
 		rec := s.sessions[ctx.Session]
 		if rec == nil {
-			rec = &sessionRec{keys: map[string]bool{}}
+			rec = &sessionRec{keys: map[string]*streamEntry{}}
 			s.sessions[ctx.Session] = rec
 		}
-		rec.keys[key] = true
+		rec.keys[key] = e
 		e.viewers++
 		s.mu.Unlock()
 		return &base.Response{StatusCode: base.StatusOK}, e.ss, nil
@@ -423,20 +434,21 @@ func (s *Server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, 
 	return &base.Response{StatusCode: base.StatusOK}, nil
 }
 
-// OnSourceState 订阅媒体源状态变迁（app 经 Mgr.OnState 接线）：仅处理
-// StateStopped——使该设备该归一化 profile 的出口流条目失效。幂等；
-// 覆盖两类陈旧：DESCRIBE-only 的孤儿条目（viewers=0 无人负责拆除）
-// 与源重建后缓存的旧 SDP 条目。条目关闭会异步联动关闭其 reader
-// 会话，各自走 OnSessionClose 释放源引用。
+// OnSourceState 在源出错、停止或恢复时检查出口缓存，重连须重新协商轨道。
 func (s *Server) OnSourceState(ss media.SourceState) {
-	if ss.State != media.StateStopped {
+	if ss.State != media.StateStopped && ss.State != media.StateError && ss.State != media.StateActive {
 		return
 	}
 	prof := s.mgr.NormProfile(ss.Profile)
 	key := ss.Device + "|" + string(prof)
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ss.State == media.StateActive {
+		if e := s.streams[key]; e == nil || e.ss.Desc == s.mgr.Desc(ss.Device, prof) {
+			return
+		}
+	}
 	s.closeEntryLocked(key, ss.Device, prof)
-	s.mu.Unlock()
 }
 
 // LoopbackURL builds the internal loopback source URL for ffmpeg

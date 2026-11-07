@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.const import CONF_HOST, CONF_PORT, CONF_TOKEN
@@ -36,7 +37,7 @@ class KonxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=asyncio.timedelta(seconds=SCAN_INTERVAL),
+            update_interval=timedelta(seconds=SCAN_INTERVAL),
         )
         self.client = KonxClient(
             entry_data[CONF_HOST], entry_data[CONF_PORT], entry_data[CONF_TOKEN]
@@ -110,7 +111,7 @@ class KonxCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def start_ws(self) -> None:
         if self._ws_task is None or self._ws_task.done():
             self._ws_task = self.hass.async_create_task(
-                self.client.listen_events(self.on_ws_message, since=self.last_event_id)
+                self.client.listen_events(self.on_ws_message, since=lambda: self.last_event_id)
             )
 
     async def stop(self) -> None:

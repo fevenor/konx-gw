@@ -224,7 +224,7 @@ var knownOps = map[string]bool{
 
 func actionOf(action, bodyXML, fallback string) string {
 	if action != "" {
-		return action
+		return opLocal(action)
 	}
 	// skip the Envelope/Body/Header wrappers: scan candidates, first hit
 	// inside the body region wins; wrappers are excluded via knownOps.

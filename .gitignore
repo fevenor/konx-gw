@@ -4,6 +4,11 @@ data/
 trace/
 
 # 构建产物与日志
-konx-gw
+/konx-gw
 *.log
 *.out
+
+# Python 测试缓存与虚拟环境
+__pycache__/
+*.pyc
+.venv/
