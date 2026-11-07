@@ -55,7 +55,7 @@ type DetectResult struct {
 type Options struct {
 	Login        func(ctx context.Context) (*cloud.Session, error)
 	ListServers  []string      // list-service hostnames/IPs
-	LocalPort    int           // local UDP bind start (51880)
+	LocalPort    int           // 正式会话固定 UDP 端口（默认 51880）
 	Heartbeat    time.Duration // default 5s
 	ReconnectMin time.Duration
 	ReconnectMax time.Duration
@@ -94,16 +94,9 @@ type UDPTransport struct {
 }
 
 func NewUDPTransport(bindPort int, dst *net.UDPAddr) (*UDPTransport, error) {
-	var conn *net.UDPConn
-	var err error
-	for p := bindPort; p < bindPort+100; p++ {
-		conn, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: p})
-		if err == nil {
-			break
-		}
-	}
-	if conn == nil || err != nil {
-		return nil, fmt.Errorf("bind %d..: %w", bindPort, err)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: bindPort})
+	if err != nil {
+		return nil, fmt.Errorf("绑定 UDP 端口 %d: %w", bindPort, err)
 	}
 	return &UDPTransport{conn: conn, dst: dst}, nil
 }
@@ -631,7 +624,7 @@ func (s *Session) detectAndSelect(ctx context.Context, cs *cloud.Session, server
 			if s.dialTransport != nil {
 				tr, err = s.dialTransport(dst)
 			} else {
-				tr, err = NewUDPTransport(s.opts.LocalPort, dst)
+				tr, err = NewUDPTransport(0, dst)
 			}
 			if err != nil {
 				return
@@ -671,6 +664,16 @@ func (s *Session) detectAndSelect(ctx context.Context, cs *cloud.Session, server
 	}
 	if !found {
 		return list.Server{}, 0, nil, fmt.Errorf("no P2P server answered detect")
+	}
+	if s.dialTransport == nil {
+		// 探测使用临时端口，正式登录重新绑定固定端口，便于容器只映射一个 UDP 端口。
+		_ = best.tr.Close()
+		dst := &net.UDPAddr{IP: net.ParseIP(best.srv.IP), Port: best.srv.Port}
+		tr, err := NewUDPTransport(s.opts.LocalPort, dst)
+		if err != nil {
+			return list.Server{}, 0, nil, err
+		}
+		best.tr = tr
 	}
 	return best.srv, best.rtt, best.tr, nil
 }

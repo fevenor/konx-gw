@@ -21,7 +21,7 @@ docker compose up -d --build
 
 ### bridge 网络
 
-不要求 host 网络。使用 `media.source: p2p-av` 时，除 Web、RTSP、ONVIF 的 TCP 端口外，还需同端口映射 IPv4 UDP `51880–51979`，见 Compose 示例。网关并行探测服务器，在该范围内选择可用端口，设备会向服务器交付的地址发送握手与媒体包；仅发布三个 TCP 端口时，可能出现云端已登录但视频建链超时。此项为宿主机到容器的映射，不要求额外配置路由器端口转发。
+不要求 host 网络。使用 `media.source: p2p-av` 时，除 Web、RTSP、ONVIF 的 TCP 端口外，还需同端口映射 IPv4 UDP `51880`，见 Compose 示例。网关使用临时端口探测服务器，选择后在固定端口建立正式会话；设备向该会话地址发送握手与媒体包。仅发布三个 TCP 端口时，可能出现云端已登录但视频建链超时。此项为宿主机到容器的映射，不要求额外配置路由器端口转发，也无需映射整个 UDP 范围。
 
 HTTP 与 RTSP 对外端口不同时，在 `advertise.host/http_port/rtsp_port` 中填写客户端实际访问的宿主机地址和端口。例如 `18080:8080` 对应 `web.listen: :8080`、`advertise.http_port: 18080`。下游 RTSP 使用 TCP；ONVIF 使用服务地址手动添加，不提供组播自动发现。
 

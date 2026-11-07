@@ -62,7 +62,7 @@ docker compose up -d --build
 
 > 也可直接 `export KONX_CLOUD_PASS='<明文密码>'`，网关仅在内存中转 MD5，不落盘。
 
-Docker 可使用 bridge，无需 host。P2P 视频除三个 TCP 服务端口外，还需同端口映射 IPv4 UDP `51880–51979`；仅映射 Web、RTSP、ONVIF 端口不足以保证设备握手包进入容器。详见 [bridge 部署说明](deploy/README.md#bridge-网络)。
+Docker 可使用 bridge，无需 host。P2P 视频除三个 TCP 服务端口外，还需同端口映射 IPv4 UDP `51880`；仅映射 Web、RTSP、ONVIF 端口不足以保证设备握手包进入容器。详见 [bridge 部署说明](deploy/README.md#bridge-网络)。
 
 可用 `KONX_ADMIN_PASSWORD` 指定 Web 管理密码、`KONX_NVR_PASSWORD` 指定 RTSP/ONVIF 用户 `nvr` 的密码。直接填写明文，无长度、复杂度要求，也无需自行哈希或加密。Compose 示例会传入这两个变量；保持变量值不变，重建容器或数据目录后也可沿用下游凭据。
 

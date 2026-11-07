@@ -10,7 +10,7 @@ services:
       - "8080:8080"                  # Web / REST / WS
       - "8554:8554"                  # RTSP（下游客户端拉流）
       - "8000:8000"                  # ONVIF
-      - "0.0.0.0:51880-51979:51880-51979/udp" # P2P 设备握手与媒体
+      - "0.0.0.0:51880:51880/udp"   # P2P 设备握手与媒体
     environment:
       - KONX_CLOUD_USER=${KONX_CLOUD_USER}
       - KONX_CLOUD_PASS_MD5=${KONX_CLOUD_PASS_MD5}
