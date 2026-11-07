@@ -487,6 +487,9 @@ func (c *Caller) meterPump() {
 		}
 		c.mu.Lock()
 		dev := c.devAddr
+		if dev == nil {
+			dev = c.mtpresAddr // 尚无设备首包时，主动探测服务器交付的地址。
+		}
 		relays := c.meterRelays
 		if c.devAcks == 0 && c.callRetry < 3 && time.Since(c.callSent) > c.opts.CallingRetry {
 			c.callRetry++
@@ -499,11 +502,13 @@ func (c *Caller) meterPump() {
 			continue
 		}
 		c.mu.Unlock()
-		if dev == nil {
-			continue // 等设备首包（源地址即 NAT 端点）
+		if dev == nil && len(relays) == 0 {
+			continue
 		}
 		req := BuildMeterReq(c.uid, c.devID, c.linkID, uint32(i))
-		_ = c.tr.SendTo(req, dev)
+		if dev != nil {
+			_ = c.tr.SendTo(req, dev)
+		}
 		for _, a := range relays {
 			_ = c.tr.SendTo(req, a)
 		}
@@ -719,7 +724,7 @@ func (c *Caller) onMtpres(p *frame.Parsed) {
 	}
 	portBE := int(p.Payload[0x34])<<8 | int(p.Payload[0x35])
 	ip := net.IPv4(p.Payload[0x38], p.Payload[0x39], p.Payload[0x3A], p.Payload[0x3B])
-	if a, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ip.String(), portBE)); err == nil {
+	if a, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", ip.String(), portBE)); err == nil && portBE != 0 && !ip.IsUnspecified() {
 		c.mu.Lock()
 		c.mtpresAddr = a
 		kp := c.kcp
